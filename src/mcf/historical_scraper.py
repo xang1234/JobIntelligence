@@ -277,7 +277,7 @@ class HistoricalScraper:
             self.batch_logger.log(year, sequence, "rate_limited", message)
         return False
 
-    async def _probe_job_exists(self, year: int, sequence: int) -> bool:
+    async def _probe_job_exists(self, year: int, sequence: int) -> Optional[bool]:
         """Check whether a historical sequence resolves to a real job."""
         if not self._client:
             raise RuntimeError("Scraper not initialized. Use 'async with' context.")
@@ -307,20 +307,42 @@ class HistoricalScraper:
                     log_failure=False,
                 )
                 if not should_retry:
-                    return False
+                    logger.warning(
+                        f"Bounds discovery for year {year} became inconclusive at seq "
+                        f"{sequence} after repeated 429s; falling back to estimate"
+                    )
+                    return None
+            except (MCFAPIError, RetryError) as e:
+                logger.warning(
+                    f"Bounds discovery for year {year} became inconclusive at seq "
+                    f"{sequence}: {e}. Falling back to estimate"
+                )
+                return None
 
-    async def _window_has_job(self, year: int, start_seq: int) -> tuple[bool, int]:
+    async def _window_has_job(
+        self,
+        year: int,
+        start_seq: int,
+    ) -> tuple[Optional[bool], int]:
         """Probe a sparse window to see whether a region still contains jobs."""
         highest_found = 0
+        inconclusive = False
         for seq in range(
             start_seq,
             min(start_seq + BOUND_DISCOVERY_WINDOW, MAX_SEQUENCE + 1),
             BOUND_DISCOVERY_STEP,
         ):
-            if await self._probe_job_exists(year, seq):
+            probe_result = await self._probe_job_exists(year, seq)
+            if probe_result is True:
                 highest_found = seq
+            elif probe_result is None:
+                inconclusive = True
 
-        return highest_found > 0, highest_found
+        if highest_found > 0:
+            return True, highest_found
+        if inconclusive:
+            return None, 0
+        return False, 0
 
     async def fetch_job(self, year: int, sequence: int) -> Optional[Job]:
         """
@@ -700,10 +722,14 @@ class HistoricalScraper:
         high = min(MAX_SEQUENCE - BOUND_DISCOVERY_WINDOW, max(estimate, 1))
 
         has_jobs, _ = await self._window_has_job(year, high)
+        if has_jobs is None:
+            return (min_seq, estimate)
         while has_jobs and high < MAX_SEQUENCE - BOUND_DISCOVERY_WINDOW:
             low = high
             high = min(high * 2, MAX_SEQUENCE - BOUND_DISCOVERY_WINDOW)
             has_jobs, _ = await self._window_has_job(year, high)
+            if has_jobs is None:
+                return (min_seq, estimate)
 
         while low + BOUND_DISCOVERY_WINDOW < high:
             mid = ((low + high) // 2 // BOUND_DISCOVERY_STEP) * BOUND_DISCOVERY_STEP
@@ -711,6 +737,8 @@ class HistoricalScraper:
                 mid = low + BOUND_DISCOVERY_STEP
 
             has_jobs, _ = await self._window_has_job(year, mid)
+            if has_jobs is None:
+                return (min_seq, estimate)
             if has_jobs:
                 low = mid
             else:
@@ -720,8 +748,11 @@ class HistoricalScraper:
         refine_end = min(MAX_SEQUENCE, high + BOUND_DISCOVERY_WINDOW)
 
         for sequence in range(refine_end, refine_start - 1, -1):
-            if await self._probe_job_exists(year, sequence):
+            probe_result = await self._probe_job_exists(year, sequence)
+            if probe_result is True:
                 return (min_seq, sequence)
+            if probe_result is None:
+                return (min_seq, estimate)
 
         return (min_seq, estimate)
 

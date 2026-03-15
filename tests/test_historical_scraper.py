@@ -2,7 +2,8 @@
 
 import asyncio
 
-from src.mcf.api_client import MCFNotFoundError, MCFRateLimitError
+from src.mcf import historical_scraper as historical_scraper_module
+from src.mcf.api_client import MCFAPIError, MCFNotFoundError, MCFRateLimitError
 from src.mcf.historical_scraper import HistoricalScraper
 
 from .factories import generate_test_job
@@ -220,3 +221,78 @@ class TestHistoricalScraper:
         assert progress.current_seq == 6
         assert sessions[0]["status"] == "completed"
         assert client.calls == [seq3_uuid, seq4_uuid, seq5_uuid]
+
+    def test_bounds_discovery_falls_back_after_rate_limit_burst(self, empty_db, monkeypatch):
+        year = 2026
+        monkeypatch.setitem(historical_scraper_module.YEAR_ESTIMATES, year, 3)
+        monkeypatch.setattr(historical_scraper_module, "BOUND_DISCOVERY_WINDOW", 1)
+        monkeypatch.setattr(historical_scraper_module, "BOUND_DISCOVERY_STEP", 1)
+
+        scraper = build_scraper(
+            empty_db.db_path,
+            discover_bounds=True,
+            max_rate_limit_retries=2,
+        )
+
+        seq1_uuid = scraper._job_uuid(year, 1)
+        seq2_uuid = scraper._job_uuid(year, 2)
+        seq3_uuid = scraper._job_uuid(year, 3)
+        client = FakeClient(
+            {
+                seq1_uuid: [generate_test_job(job_uuid=seq1_uuid)],
+                seq2_uuid: [MCFNotFoundError("missing")],
+                seq3_uuid: [
+                    MCFRateLimitError("rate limited"),
+                    MCFRateLimitError("rate limited again"),
+                    MCFNotFoundError("missing"),
+                ],
+            }
+        )
+
+        async def run():
+            await attach_fake_client(scraper, client)
+            try:
+                return await scraper.scrape_year(year, resume=False)
+            finally:
+                await close_scraper(scraper)
+
+        progress = asyncio.run(run())
+        sessions = empty_db.get_all_historical_sessions()
+
+        assert progress.current_seq == 4
+        assert sessions[0]["end_seq"] == 3
+        assert client.calls == [seq3_uuid, seq3_uuid, seq1_uuid, seq2_uuid, seq3_uuid]
+
+    def test_bounds_discovery_falls_back_after_api_error(self, empty_db, monkeypatch):
+        year = 2027
+        monkeypatch.setitem(historical_scraper_module.YEAR_ESTIMATES, year, 2)
+        monkeypatch.setattr(historical_scraper_module, "BOUND_DISCOVERY_WINDOW", 1)
+        monkeypatch.setattr(historical_scraper_module, "BOUND_DISCOVERY_STEP", 1)
+
+        scraper = build_scraper(empty_db.db_path, discover_bounds=True)
+
+        seq1_uuid = scraper._job_uuid(year, 1)
+        seq2_uuid = scraper._job_uuid(year, 2)
+        client = FakeClient(
+            {
+                seq1_uuid: [generate_test_job(job_uuid=seq1_uuid)],
+                seq2_uuid: [
+                    MCFAPIError("temporary 500"),
+                    MCFNotFoundError("missing"),
+                ],
+            }
+        )
+
+        async def run():
+            await attach_fake_client(scraper, client)
+            try:
+                return await scraper.scrape_year(year, resume=False)
+            finally:
+                await close_scraper(scraper)
+
+        progress = asyncio.run(run())
+        sessions = empty_db.get_all_historical_sessions()
+
+        assert progress.current_seq == 3
+        assert sessions[0]["end_seq"] == 2
+        assert client.calls == [seq2_uuid, seq1_uuid, seq2_uuid]
