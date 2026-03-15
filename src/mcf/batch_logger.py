@@ -2,12 +2,13 @@
 Batch logger for tracking fetch attempts.
 
 Buffers fetch attempts in memory and flushes to SQLite in batches
-for efficiency. Each fetch attempt (found, not_found, error, skipped)
-is logged for completeness verification and gap detection.
+for efficiency. Each fetch attempt (found, not_found, error, skipped,
+rate_limited) is logged for completeness verification and gap detection.
 """
 
 import atexit
 import logging
+import sqlite3
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -35,16 +36,23 @@ class BatchLogger:
         batch_logger.flush()  # Force final flush
     """
 
-    def __init__(self, db: "MCFDatabase", batch_size: int = 50):
+    def __init__(
+        self,
+        db: "MCFDatabase",
+        batch_size: int = 50,
+        conn: sqlite3.Connection | None = None,
+    ):
         """
         Initialize the batch logger.
 
         Args:
             db: MCFDatabase instance for writing attempts
             batch_size: Number of attempts to buffer before flushing
+            conn: Optional connection for long-lived writer sessions
         """
         self.db = db
         self.batch_size = batch_size
+        self.conn = conn
         self._buffer: list[dict] = []
         self._total_logged = 0
 
@@ -64,8 +72,9 @@ class BatchLogger:
         Args:
             year: Year of the job ID
             sequence: Sequence number of the job ID
-            result: Result type - 'found', 'not_found', 'error', or 'skipped'
-            error_message: Optional error message for 'error' results
+            result: Result type - 'found', 'not_found', 'error', 'skipped',
+                or 'rate_limited'
+            error_message: Optional error message for retryable results
         """
         self._buffer.append({
             "year": year,
@@ -89,7 +98,7 @@ class BatchLogger:
 
         count = len(self._buffer)
         try:
-            self.db.batch_insert_attempts(self._buffer)
+            self.db.batch_insert_attempts(self._buffer, conn=self.conn)
             self._total_logged += count
             logger.debug(f"Flushed {count} fetch attempts to database")
         except Exception as e:

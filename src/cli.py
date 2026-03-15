@@ -720,6 +720,21 @@ def scrape_historical(
     rate_limit: float = typer.Option(
         2.0, "--rate-limit", "-r", help="Requests per second"
     ),
+    max_rate_limit_retries: int = typer.Option(
+        4,
+        "--max-rate-limit-retries",
+        help="Per-sequence retry cap for 429 responses",
+    ),
+    cooldown_seconds: float = typer.Option(
+        30.0,
+        "--cooldown-seconds",
+        help="Global cooldown after repeated 429 responses",
+    ),
+    discover_bounds: bool = typer.Option(
+        True,
+        "--discover-bounds/--no-discover-bounds",
+        help="Discover a tighter end bound before scanning",
+    ),
     not_found_threshold: int = typer.Option(
         1000, "--not-found-threshold", help="Stop after N consecutive not-found"
     ),
@@ -777,6 +792,9 @@ def scrape_historical(
         console.print(f"Range: [green]{start}[/green] to [green]{end}[/green]")
 
     console.print(f"Rate limit: {rate_limit} req/sec")
+    console.print(f"Max 429 retries: {max_rate_limit_retries}")
+    console.print(f"429 cooldown: {cooldown_seconds:.1f}s")
+    console.print(f"Discover bounds: {'yes' if discover_bounds else 'no'}")
     console.print(f"Database: {db_path}")
     console.print()
 
@@ -785,6 +803,9 @@ def scrape_historical(
             db_path=db_path,
             requests_per_second=rate_limit,
             not_found_threshold=not_found_threshold,
+            max_rate_limit_retries=max_rate_limit_retries,
+            cooldown_seconds=cooldown_seconds,
+            discover_bounds=discover_bounds,
         ) as scraper:
             # Set up progress display
             with Progress(
@@ -999,6 +1020,21 @@ def daemon_cmd(
     rate_limit: float = typer.Option(
         2.0, "--rate-limit", "-r", help="Initial requests per second"
     ),
+    max_rate_limit_retries: int = typer.Option(
+        4,
+        "--max-rate-limit-retries",
+        help="Per-sequence retry cap for 429 responses",
+    ),
+    cooldown_seconds: float = typer.Option(
+        30.0,
+        "--cooldown-seconds",
+        help="Global cooldown after repeated 429 responses",
+    ),
+    discover_bounds: bool = typer.Option(
+        True,
+        "--discover-bounds/--no-discover-bounds",
+        help="Discover a tighter end bound before scanning",
+    ),
     db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Database path"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Debug logging"),
 ) -> None:
@@ -1057,6 +1093,9 @@ def daemon_cmd(
                 console.print("Mode: [green]All years (2019-2026)[/green]")
 
             console.print(f"Rate limit: {rate_limit} req/sec")
+            console.print(f"Max 429 retries: {max_rate_limit_retries}")
+            console.print(f"429 cooldown: {cooldown_seconds:.1f}s")
+            console.print(f"Discover bounds: {'yes' if discover_bounds else 'no'}")
             console.print(f"Database: {db_path}")
             console.print()
 
@@ -1065,6 +1104,9 @@ def daemon_cmd(
                 all_years=all_years,
                 rate_limit=rate_limit,
                 db_path=db_path,
+                max_rate_limit_retries=max_rate_limit_retries,
+                cooldown_seconds=cooldown_seconds,
+                discover_bounds=discover_bounds,
             )
             console.print(f"[green]Daemon started with PID {pid}[/green]")
             console.print(f"\nLogs: [cyan]{daemon.logfile}[/cyan]")
@@ -1095,6 +1137,9 @@ def daemon_worker(
     year: Optional[int] = typer.Option(None, "--year", "-y"),
     all_years: bool = typer.Option(False, "--all"),
     rate_limit: float = typer.Option(2.0, "--rate-limit", "-r"),
+    max_rate_limit_retries: int = typer.Option(4, "--max-rate-limit-retries"),
+    cooldown_seconds: float = typer.Option(30.0, "--cooldown-seconds"),
+    discover_bounds: bool = typer.Option(True, "--discover-bounds/--no-discover-bounds"),
     db_path: str = typer.Option("data/mcf_jobs.db", "--db"),
     pidfile: str = typer.Option("data/.scraper.pid", "--pidfile"),
     logfile: str = typer.Option("data/scraper_daemon.log", "--logfile"),
@@ -1115,6 +1160,9 @@ def daemon_worker(
         async with HistoricalScraper(
             db_path=db_path,
             requests_per_second=rate_limit,
+            max_rate_limit_retries=max_rate_limit_retries,
+            cooldown_seconds=cooldown_seconds,
+            discover_bounds=discover_bounds,
         ) as scraper:
             if year:
                 return await scraper.scrape_year(year, resume=True)
@@ -1159,7 +1207,7 @@ def show_gaps(
 
     total_gaps = 0
     total_missing = 0
-    total_errors = 0
+    total_retryable = 0
 
     for y in years_to_check:
         gaps = db.get_missing_sequences(y)
@@ -1174,7 +1222,7 @@ def show_gaps(
         missing_count = sum(end - start + 1 for start, end in gaps)
         total_gaps += len(gaps)
         total_missing += missing_count
-        total_errors += len(failed)
+        total_retryable += len(failed)
 
         console.print(f"[bold]Year {y}:[/bold]")
         console.print(f"  Sequences attempted: {stats.get('total', 0):,}")
@@ -1182,6 +1230,7 @@ def show_gaps(
         console.print(f"  Not found: {stats.get('not_found', 0):,}")
         console.print(f"  Skipped: {stats.get('skipped', 0):,}")
         console.print(f"  Errors: [red]{stats.get('error', 0):,}[/red]")
+        console.print(f"  Rate limited: [yellow]{stats.get('rate_limited', 0):,}[/yellow]")
 
         if gaps:
             console.print(f"\n  [yellow]Gaps ({len(gaps)} ranges, {missing_count:,} sequences):[/yellow]")
@@ -1193,7 +1242,7 @@ def show_gaps(
             console.print("  [green]No gaps detected[/green]")
 
         if failed:
-            console.print(f"\n  [red]Failed attempts: {len(failed):,}[/red]")
+            console.print(f"\n  [red]Retryable attempts: {len(failed):,}[/red]")
 
         console.print()
 
@@ -1202,9 +1251,9 @@ def show_gaps(
         console.print("[bold]Summary:[/bold]")
         console.print(f"  Total gaps: {total_gaps}")
         console.print(f"  Total missing sequences: {total_missing:,}")
-        console.print(f"  Total errors to retry: {total_errors:,}")
+        console.print(f"  Total retryable attempts: {total_retryable:,}")
 
-        if total_missing + total_errors > 0:
+        if total_missing + total_retryable > 0:
             console.print(f"\nRun [bold]mcf retry-gaps --all[/bold] to retry missing sequences")
 
 
@@ -1218,6 +1267,21 @@ def retry_gaps(
     ),
     rate_limit: float = typer.Option(
         2.0, "--rate-limit", "-r", help="Requests per second"
+    ),
+    max_rate_limit_retries: int = typer.Option(
+        4,
+        "--max-rate-limit-retries",
+        help="Per-sequence retry cap for 429 responses",
+    ),
+    cooldown_seconds: float = typer.Option(
+        30.0,
+        "--cooldown-seconds",
+        help="Global cooldown after repeated 429 responses",
+    ),
+    discover_bounds: bool = typer.Option(
+        True,
+        "--discover-bounds/--no-discover-bounds",
+        help="Discover tighter year bounds when initializing the scraper",
     ),
     db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Database path"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Debug logging"),
@@ -1243,6 +1307,9 @@ def retry_gaps(
         async with HistoricalScraper(
             db_path=db_path,
             requests_per_second=rate_limit,
+            max_rate_limit_retries=max_rate_limit_retries,
+            cooldown_seconds=cooldown_seconds,
+            discover_bounds=discover_bounds,
         ) as scraper:
             with Progress(
                 SpinnerColumn(),
@@ -1340,6 +1407,7 @@ def attempt_stats(
         console.print(f"  Not found: {stats.get('not_found', 0):,}")
         console.print(f"  Skipped: {stats.get('skipped', 0):,}")
         console.print(f"  Errors: [red]{stats.get('error', 0):,}[/red]")
+        console.print(f"  Rate limited: [yellow]{stats.get('rate_limited', 0):,}[/yellow]")
 
         if stats.get("min_sequence"):
             console.print(f"\n  Sequence range: {stats['min_sequence']:,} - {stats['max_sequence']:,}")

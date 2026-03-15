@@ -236,11 +236,24 @@ class MCFDatabase:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
+    def _connect(self, write_optimized: bool = False) -> sqlite3.Connection:
+        """Create a configured SQLite connection."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
+
+        if write_optimized:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA temp_store = MEMORY")
+
+        return conn
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         """Context manager for database connections."""
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
+        conn = self._connect()
         try:
             yield conn
             conn.commit()
@@ -338,7 +351,11 @@ class MCFDatabase:
                 conn.commit()
                 logger.info("FTS5 index created")
 
-    def upsert_job(self, job: Job) -> tuple[bool, bool]:
+    def upsert_job(
+        self,
+        job: Job,
+        conn: sqlite3.Connection | None = None,
+    ) -> tuple[bool, bool]:
         """
         Insert or update a job record.
 
@@ -355,7 +372,11 @@ class MCFDatabase:
         job_data = job.to_flat_dict()
         now = datetime.now().isoformat()
 
-        with self._connection() as conn:
+        owns_connection = conn is None
+        if conn is None:
+            conn = self._connect(write_optimized=True)
+
+        try:
             # Check if job exists
             existing = conn.execute(
                 "SELECT * FROM jobs WHERE uuid = ?", (job.uuid,)
@@ -365,6 +386,8 @@ class MCFDatabase:
                 # New job - insert
                 self._insert_job(conn, job_data, now)
                 logger.debug(f"Inserted new job: {job.uuid}")
+                if owns_connection:
+                    conn.commit()
                 return (True, False)
 
             # Existing job - check for changes
@@ -377,10 +400,21 @@ class MCFDatabase:
                 # Update job
                 self._update_job(conn, job_data, now)
                 logger.debug(f"Updated job {job.uuid}: {', '.join(changes)}")
+                if owns_connection:
+                    conn.commit()
                 return (False, True)
 
             # No changes
+            if owns_connection:
+                conn.commit()
             return (False, False)
+        except Exception:
+            if owns_connection:
+                conn.rollback()
+            raise
+        finally:
+            if owns_connection:
+                conn.close()
 
     def _insert_job(
         self, conn: sqlite3.Connection, job_data: dict, timestamp: str
@@ -937,7 +971,11 @@ class MCFDatabase:
     # Historical scrape progress methods
 
     def create_historical_session(
-        self, year: int, start_seq: int, end_seq: Optional[int] = None
+        self,
+        year: int,
+        start_seq: int,
+        end_seq: Optional[int] = None,
+        conn: sqlite3.Connection | None = None,
     ) -> int:
         """
         Create a new historical scrape session.
@@ -950,7 +988,11 @@ class MCFDatabase:
         Returns:
             Session ID
         """
-        with self._connection() as conn:
+        owns_connection = conn is None
+        if conn is None:
+            conn = self._connect(write_optimized=True)
+
+        try:
             cursor = conn.execute(
                 """
                 INSERT INTO historical_scrape_progress
@@ -959,7 +1001,16 @@ class MCFDatabase:
                 """,
                 (year, start_seq, start_seq, end_seq),
             )
+            if owns_connection:
+                conn.commit()
             return cursor.lastrowid
+        except Exception:
+            if owns_connection:
+                conn.rollback()
+            raise
+        finally:
+            if owns_connection:
+                conn.close()
 
     def update_historical_progress(
         self,
@@ -968,9 +1019,15 @@ class MCFDatabase:
         jobs_found: int,
         jobs_not_found: int,
         consecutive_not_found: int = 0,
+        end_seq: Optional[int] = None,
+        conn: sqlite3.Connection | None = None,
     ) -> None:
         """Update historical scrape progress."""
-        with self._connection() as conn:
+        owns_connection = conn is None
+        if conn is None:
+            conn = self._connect(write_optimized=True)
+
+        try:
             conn.execute(
                 """
                 UPDATE historical_scrape_progress
@@ -978,15 +1035,40 @@ class MCFDatabase:
                     jobs_found = ?,
                     jobs_not_found = ?,
                     consecutive_not_found = ?,
+                    end_seq = COALESCE(?, end_seq),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (current_seq, jobs_found, jobs_not_found, consecutive_not_found, session_id),
+                (
+                    current_seq,
+                    jobs_found,
+                    jobs_not_found,
+                    consecutive_not_found,
+                    end_seq,
+                    session_id,
+                ),
             )
+            if owns_connection:
+                conn.commit()
+        except Exception:
+            if owns_connection:
+                conn.rollback()
+            raise
+        finally:
+            if owns_connection:
+                conn.close()
 
-    def complete_historical_session(self, session_id: int) -> None:
+    def complete_historical_session(
+        self,
+        session_id: int,
+        conn: sqlite3.Connection | None = None,
+    ) -> None:
         """Mark historical session as completed."""
-        with self._connection() as conn:
+        owns_connection = conn is None
+        if conn is None:
+            conn = self._connect(write_optimized=True)
+
+        try:
             conn.execute(
                 """
                 UPDATE historical_scrape_progress
@@ -995,6 +1077,15 @@ class MCFDatabase:
                 """,
                 (session_id,),
             )
+            if owns_connection:
+                conn.commit()
+        except Exception:
+            if owns_connection:
+                conn.rollback()
+            raise
+        finally:
+            if owns_connection:
+                conn.close()
 
     def get_incomplete_historical_session(self, year: int) -> Optional[dict]:
         """
@@ -1112,7 +1203,11 @@ class MCFDatabase:
 
     # Fetch attempt logging methods
 
-    def batch_insert_attempts(self, attempts: list[dict]) -> int:
+    def batch_insert_attempts(
+        self,
+        attempts: list[dict],
+        conn: sqlite3.Connection | None = None,
+    ) -> int:
         """
         Insert or replace batch of fetch attempts.
 
@@ -1129,7 +1224,11 @@ class MCFDatabase:
         if not attempts:
             return 0
 
-        with self._connection() as conn:
+        owns_connection = conn is None
+        if conn is None:
+            conn = self._connect(write_optimized=True)
+
+        try:
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO fetch_attempts
@@ -1138,7 +1237,16 @@ class MCFDatabase:
                 """,
                 attempts,
             )
+            if owns_connection:
+                conn.commit()
             return len(attempts)
+        except Exception:
+            if owns_connection:
+                conn.rollback()
+            raise
+        finally:
+            if owns_connection:
+                conn.close()
 
     def get_missing_sequences(self, year: int) -> list[tuple[int, int]]:
         """
@@ -1202,7 +1310,7 @@ class MCFDatabase:
 
     def get_failed_attempts(self, year: int, limit: int = 10000) -> list[dict]:
         """
-        Get all attempts with result='error' for retry.
+        Get all retryable attempts for a year.
 
         Args:
             year: Year to query
@@ -1216,7 +1324,7 @@ class MCFDatabase:
                 """
                 SELECT year, sequence, result, error_message, attempted_at
                 FROM fetch_attempts
-                WHERE year = ? AND result = 'error'
+                WHERE year = ? AND result IN ('error', 'rate_limited')
                 ORDER BY sequence
                 LIMIT ?
                 """,

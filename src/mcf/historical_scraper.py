@@ -19,8 +19,8 @@ Enhanced Features:
 import asyncio
 import hashlib
 import logging
+import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Optional, Callable, Awaitable
 
 from tenacity import RetryError
@@ -47,6 +47,13 @@ YEAR_ESTIMATES = {
 
 # Stop scanning after this many consecutive not-found responses
 DEFAULT_NOT_FOUND_THRESHOLD = 1000
+DEFAULT_MAX_RATE_LIMIT_RETRIES = 4
+DEFAULT_COOLDOWN_SECONDS = 30.0
+DEFAULT_RATE_LIMIT_COOLDOWN_THRESHOLD = 3
+DEFAULT_BATCH_SIZE = 250
+BOUND_DISCOVERY_WINDOW = 125
+BOUND_DISCOVERY_STEP = 25
+MAX_SEQUENCE = 9_999_999
 
 
 @dataclass
@@ -95,9 +102,12 @@ class HistoricalScraper:
         db_path: str = "data/mcf_jobs.db",
         requests_per_second: float = 2.0,
         not_found_threshold: int = DEFAULT_NOT_FOUND_THRESHOLD,
-        batch_size: int = 50,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         min_rps: float = 0.5,
         max_rps: float = 5.0,
+        max_rate_limit_retries: int = DEFAULT_MAX_RATE_LIMIT_RETRIES,
+        cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
+        discover_bounds: bool = True,
     ):
         """
         Initialize the historical scraper.
@@ -109,11 +119,19 @@ class HistoricalScraper:
             batch_size: Number of attempts to buffer before flushing to DB
             min_rps: Minimum requests per second (during heavy rate limiting)
             max_rps: Maximum requests per second (after recovery)
+            max_rate_limit_retries: Per-sequence retry cap for 429s
+            cooldown_seconds: Global cooldown after repeated 429s
+            discover_bounds: Discover a tighter end bound before scanning
         """
         self.db = MCFDatabase(db_path)
         self.initial_rps = requests_per_second
         self.not_found_threshold = not_found_threshold
+        self.max_rate_limit_retries = max_rate_limit_retries
+        self.cooldown_seconds = cooldown_seconds
+        self.discover_bounds = discover_bounds
         self._client: Optional[MCFClient] = None
+        self._write_conn: Optional[sqlite3.Connection] = None
+        self._global_rate_limit_streak = 0
 
         # New components for robust operation
         self.batch_logger = BatchLogger(self.db, batch_size=batch_size)
@@ -127,12 +145,21 @@ class HistoricalScraper:
         """Async context manager entry."""
         self._client = MCFClient(requests_per_second=self.initial_rps)
         await self._client.__aenter__()
+        self._write_conn = self.db._connect(write_optimized=True)
+        self.batch_logger.conn = self._write_conn
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Async context manager exit."""
         # Flush any pending batch logger entries
-        self.batch_logger.flush()
+        if self._write_conn:
+            try:
+                self.batch_logger.flush()
+                self._write_conn.commit()
+            finally:
+                self._write_conn.close()
+                self._write_conn = None
+                self.batch_logger.conn = None
 
         if self._client:
             await self._client.__aexit__(exc_type, exc_val, exc_tb)
@@ -181,6 +208,120 @@ class HistoricalScraper:
             raise ValueError(f"Invalid job ID format: {job_id}")
         return int(parts[1]), int(parts[2])
 
+    def _job_uuid(self, year: int, sequence: int) -> str:
+        """Build the deterministic UUID for a historical job sequence."""
+        return self.job_id_to_uuid(self.format_job_id(year, sequence))
+
+    def _update_client_rate(self, new_rps: float) -> None:
+        """Keep the API client aligned with the adaptive limiter state."""
+        if self._client:
+            self._client.requests_per_second = new_rps
+
+    def _mark_progress_committed(self) -> None:
+        """Commit pending writes on the long-lived scraper connection."""
+        if self._write_conn:
+            self._write_conn.commit()
+
+    def _reset_rate_limit_streak(self) -> None:
+        """Clear the consecutive global rate-limit streak after progress."""
+        self._global_rate_limit_streak = 0
+
+    async def _handle_rate_limit(
+        self,
+        year: int,
+        sequence: int,
+        retry_count: int,
+        *,
+        context: str,
+        log_failure: bool = True,
+    ) -> bool:
+        """
+        Back off on 429s and decide whether to retry the same sequence.
+
+        Returns:
+            True if the caller should retry the same sequence, else False.
+        """
+        new_rps = self.rate_limiter.on_rate_limited()
+        self._update_client_rate(new_rps)
+        self._global_rate_limit_streak += 1
+
+        if self._global_rate_limit_streak >= DEFAULT_RATE_LIMIT_COOLDOWN_THRESHOLD:
+            logger.warning(
+                f"{context} at seq {sequence} triggered cooldown after "
+                f"{self._global_rate_limit_streak} consecutive 429s; "
+                f"sleeping {self.cooldown_seconds:.1f}s"
+            )
+            await asyncio.sleep(self.cooldown_seconds)
+            self._global_rate_limit_streak = 0
+        else:
+            backoff_delay = 1.0 / new_rps + 1.0
+            logger.warning(
+                f"{context} at seq {sequence}, backing off {backoff_delay:.1f}s, "
+                f"new rate: {new_rps:.2f} req/sec "
+                f"(retry {retry_count}/{self.max_rate_limit_retries})"
+            )
+            await asyncio.sleep(backoff_delay)
+
+        if retry_count < self.max_rate_limit_retries:
+            return True
+
+        message = (
+            f"rate_limited_after_{retry_count}_retries"
+            f" at {new_rps:.2f} req/sec"
+        )
+        logger.warning(
+            f"Skipping seq {sequence} for year {year} after {retry_count} 429s; "
+            "recording for retry-gaps"
+        )
+        if log_failure:
+            self.batch_logger.log(year, sequence, "rate_limited", message)
+        return False
+
+    async def _probe_job_exists(self, year: int, sequence: int) -> bool:
+        """Check whether a historical sequence resolves to a real job."""
+        if not self._client:
+            raise RuntimeError("Scraper not initialized. Use 'async with' context.")
+
+        uuid = self._job_uuid(year, sequence)
+        retry_count = 0
+
+        while True:
+            try:
+                await self._client.get_job(uuid)
+                self.rate_limiter.on_success()
+                self._reset_rate_limit_streak()
+                self._update_client_rate(self.rate_limiter.current_rps)
+                return True
+            except MCFNotFoundError:
+                self.rate_limiter.on_success()
+                self._reset_rate_limit_streak()
+                self._update_client_rate(self.rate_limiter.current_rps)
+                return False
+            except MCFRateLimitError:
+                retry_count += 1
+                should_retry = await self._handle_rate_limit(
+                    year,
+                    sequence,
+                    retry_count=retry_count,
+                    context="Rate limited during bounds discovery",
+                    log_failure=False,
+                )
+                if not should_retry:
+                    return False
+
+    async def _window_has_job(self, year: int, start_seq: int) -> tuple[bool, int]:
+        """Probe a sparse window to see whether a region still contains jobs."""
+        highest_found = 0
+        for seq in range(
+            start_seq,
+            min(start_seq + BOUND_DISCOVERY_WINDOW, MAX_SEQUENCE + 1),
+            BOUND_DISCOVERY_STEP,
+        ):
+            if await self._probe_job_exists(year, seq):
+                highest_found = seq
+
+        return highest_found > 0, highest_found
+
     async def fetch_job(self, year: int, sequence: int) -> Optional[Job]:
         """
         Fetch a single job by year and sequence.
@@ -199,13 +340,7 @@ class HistoricalScraper:
         if not self._client:
             raise RuntimeError("Scraper not initialized. Use 'async with' context.")
 
-        job_id = self.format_job_id(year, sequence)
-        uuid = self.job_id_to_uuid(job_id)
-
-        # Skip if already in database (indexed point query, ~0.1ms)
-        if self.db.has_job(uuid):
-            logger.debug(f"Skipping existing job: {job_id}")
-            return None
+        uuid = self._job_uuid(year, sequence)
 
         try:
             job = await self._client.get_job(uuid)
@@ -239,15 +374,17 @@ class HistoricalScraper:
         if not self._client:
             raise RuntimeError("Scraper not initialized. Use 'async with' context.")
 
-        # Determine end sequence
+        explicit_end_seq = end_seq is not None
+        estimated_end_seq = YEAR_ESTIMATES.get(year, 1_000_000)
         if end_seq is None:
-            end_seq = YEAR_ESTIMATES.get(year, 1_000_000)
+            end_seq = estimated_end_seq
 
         # Check for existing session to resume
         session_id: Optional[int] = None
         jobs_found = 0
         jobs_not_found = 0
         consecutive_not_found = 0
+        existing_session = None
 
         if resume:
             existing_session = self.db.get_incomplete_historical_session(year)
@@ -257,15 +394,48 @@ class HistoricalScraper:
                 jobs_found = existing_session["jobs_found"]
                 jobs_not_found = existing_session["jobs_not_found"]
                 consecutive_not_found = existing_session["consecutive_not_found"]
+                if existing_session.get("end_seq"):
+                    end_seq = existing_session["end_seq"]
                 logger.info(
                     f"Resuming year {year} from sequence {start_seq:,} "
                     f"({jobs_found:,} found, {jobs_not_found:,} not found)"
                 )
 
+        should_discover_bounds = (
+            self.discover_bounds
+            and not dry_run
+            and not explicit_end_seq
+            and end_seq is not None
+            and (session_id is None or end_seq == estimated_end_seq)
+        )
+
+        if should_discover_bounds:
+            _, discovered_end_seq = await self.find_year_bounds(year)
+            if discovered_end_seq > 0:
+                end_seq = min(end_seq, discovered_end_seq)
+                logger.info(f"Using discovered end bound for {year}: {end_seq:,}")
+
         # Create new session if needed
         if session_id is None and not dry_run:
-            session_id = self.db.create_historical_session(year, start_seq, end_seq)
+            session_id = self.db.create_historical_session(
+                year,
+                start_seq,
+                end_seq,
+                conn=self._write_conn,
+            )
+            self._mark_progress_committed()
             logger.info(f"Created new session {session_id} for year {year}")
+        elif session_id and not dry_run and should_discover_bounds:
+            self.db.update_historical_progress(
+                session_id,
+                start_seq - 1,
+                jobs_found,
+                jobs_not_found,
+                consecutive_not_found,
+                end_seq=end_seq,
+                conn=self._write_conn,
+            )
+            self._mark_progress_committed()
 
         current_seq = start_seq
         checkpoint_interval = 100  # Save progress every N jobs
@@ -276,6 +446,7 @@ class HistoricalScraper:
         )
         logger.info(f"Rate limiter: {self.rate_limiter.current_rps:.2f} req/sec")
 
+        rate_limit_retries = 0
         try:
             while current_seq <= end_seq:
                 # Check for early termination
@@ -288,8 +459,7 @@ class HistoricalScraper:
 
                 if dry_run:
                     # In dry run, just count without fetching
-                    job_id = self.format_job_id(year, current_seq)
-                    uuid = self.job_id_to_uuid(job_id)
+                    uuid = self._job_uuid(year, current_seq)
                     if self.db.has_job(uuid):
                         jobs_found += 1
                         self.batch_logger.log(year, current_seq, 'skipped')
@@ -297,6 +467,7 @@ class HistoricalScraper:
                         jobs_not_found += 1
                         self.batch_logger.log(year, current_seq, 'not_found')
                     current_seq += 1
+                    rate_limit_retries = 0
                     continue
 
                 try:
@@ -304,46 +475,38 @@ class HistoricalScraper:
 
                     if job:
                         # Save to database
-                        is_new, was_updated = self.db.upsert_job(job)
+                        is_new, _ = self.db.upsert_job(job, conn=self._write_conn)
                         jobs_found += 1
                         consecutive_not_found = 0
 
                         # Log successful fetch
                         self.batch_logger.log(year, current_seq, 'found')
                         self.rate_limiter.on_success()
+                        self._reset_rate_limit_streak()
 
                         # Update client rate if changed significantly
-                        if self._client:
-                            self._client.requests_per_second = self.rate_limiter.current_rps
+                        self._update_client_rate(self.rate_limiter.current_rps)
 
                         if is_new:
                             logger.debug(f"New job: {job.title[:50]} ({job.company_name})")
                     else:
                         jobs_not_found += 1
-                        # Check if it was skipped (already exists) vs truly not found
-                        uuid = self.job_id_to_uuid(self.format_job_id(year, current_seq))
-                        if not self.db.has_job(uuid):
-                            consecutive_not_found += 1
-                            self.batch_logger.log(year, current_seq, 'not_found')
-                        else:
-                            consecutive_not_found = 0
-                            self.batch_logger.log(year, current_seq, 'skipped')
+                        consecutive_not_found += 1
+                        self.batch_logger.log(year, current_seq, 'not_found')
                         self.rate_limiter.on_success()
+                        self._reset_rate_limit_streak()
+                        self._update_client_rate(self.rate_limiter.current_rps)
 
                 except MCFRateLimitError:
-                    # Use adaptive rate limiter for backoff
-                    new_rps = self.rate_limiter.on_rate_limited()
-                    if self._client:
-                        self._client.requests_per_second = new_rps
-
-                    # Wait based on new rate (inverse of RPS)
-                    backoff_delay = 1.0 / new_rps + 1.0  # Extra 1s buffer
-                    logger.warning(
-                        f"Rate limited at seq {current_seq}, "
-                        f"backing off {backoff_delay:.1f}s, new rate: {new_rps:.2f} req/sec"
+                    rate_limit_retries += 1
+                    should_retry = await self._handle_rate_limit(
+                        year,
+                        current_seq,
+                        retry_count=rate_limit_retries,
+                        context="Rate limited"
                     )
-                    await asyncio.sleep(backoff_delay)
-                    continue  # Don't increment sequence, retry
+                    if should_retry:
+                        continue
 
                 except MCFAPIError as e:
                     logger.error(f"API error at {year}-{current_seq}: {e}")
@@ -356,16 +519,15 @@ class HistoricalScraper:
                     # Tenacity exhausted retries - check if underlying cause was rate limit
                     cause = e.last_attempt.exception() if e.last_attempt else None
                     if isinstance(cause, MCFRateLimitError):
-                        new_rps = self.rate_limiter.on_rate_limited()
-                        if self._client:
-                            self._client.requests_per_second = new_rps
-                        backoff_delay = 1.0 / new_rps + 5.0  # Longer backoff after retry exhaustion
-                        logger.warning(
-                            f"Retries exhausted due to rate limiting at seq {current_seq}, "
-                            f"backing off {backoff_delay:.1f}s, new rate: {new_rps:.2f} req/sec"
+                        rate_limit_retries += 1
+                        should_retry = await self._handle_rate_limit(
+                            year,
+                            current_seq,
+                            retry_count=rate_limit_retries,
+                            context="Retries exhausted due to rate limiting",
                         )
-                        await asyncio.sleep(backoff_delay)
-                        continue  # Retry same sequence
+                        if should_retry:
+                            continue
                     else:
                         # Other retry error - log and continue
                         logger.error(f"Retry exhausted at {year}-{current_seq}: {e}")
@@ -384,6 +546,7 @@ class HistoricalScraper:
 
                 # Update progress
                 current_seq += 1
+                rate_limit_retries = 0
 
                 # Checkpoint periodically
                 if session_id and (current_seq - start_seq) % checkpoint_interval == 0:
@@ -393,7 +556,11 @@ class HistoricalScraper:
                         jobs_found,
                         jobs_not_found,
                         consecutive_not_found,
+                        end_seq=end_seq,
+                        conn=self._write_conn,
                     )
+                    self.batch_logger.flush()
+                    self._mark_progress_committed()
 
                     # Progress callback
                     if progress_callback:
@@ -411,6 +578,7 @@ class HistoricalScraper:
         finally:
             # Flush batch logger
             self.batch_logger.flush()
+            self._mark_progress_committed()
 
             # Final progress update
             if session_id:
@@ -420,11 +588,15 @@ class HistoricalScraper:
                     jobs_found,
                     jobs_not_found,
                     consecutive_not_found,
+                    end_seq=end_seq,
+                    conn=self._write_conn,
                 )
+                self._mark_progress_committed()
 
         # Mark completed if we finished normally
         if session_id and current_seq > end_seq:
-            self.db.complete_historical_session(session_id)
+            self.db.complete_historical_session(session_id, conn=self._write_conn)
+            self._mark_progress_committed()
             logger.info(f"Completed year {year}")
 
         return ScrapeProgress(
@@ -507,9 +679,11 @@ class HistoricalScraper:
 
     async def find_year_bounds(self, year: int) -> tuple[int, int]:
         """
-        Use binary search to find the valid sequence range for a year.
+        Discover a tighter upper sequence bound for a year.
 
-        This helps avoid wasted requests on non-existent IDs.
+        Historical IDs are dense but not perfectly contiguous, so the search
+        probes sparse windows instead of assuming every missing ID means the
+        year has ended.
 
         Args:
             year: Year to find bounds for
@@ -520,28 +694,36 @@ class HistoricalScraper:
         if not self._client:
             raise RuntimeError("Scraper not initialized. Use 'async with' context.")
 
-        # Find minimum (usually 1, but check)
         min_seq = 1
-
-        # Binary search for maximum
+        estimate = YEAR_ESTIMATES.get(year, 1_000_000)
         low = 1
-        high = YEAR_ESTIMATES.get(year, 1_000_000) * 2  # Search beyond estimate
+        high = min(MAX_SEQUENCE - BOUND_DISCOVERY_WINDOW, max(estimate, 1))
 
-        while low < high:
-            mid = (low + high + 1) // 2
-            uuid = self.job_id_to_uuid(self.format_job_id(year, mid))
+        has_jobs, _ = await self._window_has_job(year, high)
+        while has_jobs and high < MAX_SEQUENCE - BOUND_DISCOVERY_WINDOW:
+            low = high
+            high = min(high * 2, MAX_SEQUENCE - BOUND_DISCOVERY_WINDOW)
+            has_jobs, _ = await self._window_has_job(year, high)
 
-            try:
-                await self._client.get_job(uuid)
-                low = mid  # Found, search higher
-            except MCFNotFoundError:
-                high = mid - 1  # Not found, search lower
-            except MCFRateLimitError:
-                # Back off and retry
-                await asyncio.sleep(5.0)
-                continue
+        while low + BOUND_DISCOVERY_WINDOW < high:
+            mid = ((low + high) // 2 // BOUND_DISCOVERY_STEP) * BOUND_DISCOVERY_STEP
+            if mid <= low:
+                mid = low + BOUND_DISCOVERY_STEP
 
-        return (min_seq, low)
+            has_jobs, _ = await self._window_has_job(year, mid)
+            if has_jobs:
+                low = mid
+            else:
+                high = mid - BOUND_DISCOVERY_STEP
+
+        refine_start = max(min_seq, low - BOUND_DISCOVERY_WINDOW)
+        refine_end = min(MAX_SEQUENCE, high + BOUND_DISCOVERY_WINDOW)
+
+        for sequence in range(refine_end, refine_start - 1, -1):
+            if await self._probe_job_exists(year, sequence):
+                return (min_seq, sequence)
+
+        return (min_seq, estimate)
 
     async def retry_gaps(
         self,
@@ -600,40 +782,52 @@ class HistoricalScraper:
         jobs_not_found = 0
 
         for i, seq in enumerate(sequences_to_retry):
-            try:
-                job = await self.fetch_job(year, seq)
+            rate_limit_retries = 0
+            while True:
+                try:
+                    job = await self.fetch_job(year, seq)
 
-                if job:
-                    is_new, _ = self.db.upsert_job(job)
-                    jobs_found += 1
-                    self.batch_logger.log(year, seq, 'found')
-                    self.rate_limiter.on_success()
+                    if job:
+                        is_new, _ = self.db.upsert_job(job, conn=self._write_conn)
+                        jobs_found += 1
+                        self.batch_logger.log(year, seq, 'found')
+                        self.rate_limiter.on_success()
+                        self._reset_rate_limit_streak()
+                        self._update_client_rate(self.rate_limiter.current_rps)
 
-                    if is_new:
-                        logger.debug(f"Recovered job: {job.title[:50]}")
-                else:
-                    uuid = self.job_id_to_uuid(self.format_job_id(year, seq))
-                    if self.db.has_job(uuid):
-                        self.batch_logger.log(year, seq, 'skipped')
+                        if is_new:
+                            logger.debug(f"Recovered job: {job.title[:50]}")
                     else:
                         self.batch_logger.log(year, seq, 'not_found')
                         jobs_not_found += 1
-                    self.rate_limiter.on_success()
+                        self.rate_limiter.on_success()
+                        self._reset_rate_limit_streak()
+                        self._update_client_rate(self.rate_limiter.current_rps)
+                    break
 
-            except MCFRateLimitError:
-                new_rps = self.rate_limiter.on_rate_limited()
-                if self._client:
-                    self._client.requests_per_second = new_rps
-                await asyncio.sleep(1.0 / new_rps + 1.0)
-                # Log as error for retry later
-                self.batch_logger.log(year, seq, 'error', 'rate_limited')
+                except MCFRateLimitError:
+                    rate_limit_retries += 1
+                    should_retry = await self._handle_rate_limit(
+                        year,
+                        seq,
+                        retry_count=rate_limit_retries,
+                        context="Gap retry rate limited",
+                    )
+                    if should_retry:
+                        continue
+                    break
 
-            except MCFAPIError as e:
-                self.batch_logger.log(year, seq, 'error', str(e))
-                self.rate_limiter.on_error()
-                jobs_not_found += 1
+                except MCFAPIError as e:
+                    self.batch_logger.log(year, seq, 'error', str(e))
+                    self.rate_limiter.on_error()
+                    jobs_not_found += 1
+                    break
 
             # Progress callback every 100 sequences
+            if (i + 1) % 100 == 0:
+                self.batch_logger.flush()
+                self._mark_progress_committed()
+
             if progress_callback and (i + 1) % 100 == 0:
                 progress = ScrapeProgress(
                     year=year,
@@ -648,6 +842,7 @@ class HistoricalScraper:
 
         # Final flush
         self.batch_logger.flush()
+        self._mark_progress_committed()
 
         logger.info(
             f"Gap retry complete for year {year}: "

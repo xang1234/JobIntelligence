@@ -128,6 +128,9 @@ class ScraperDaemon:
         all_years: bool = False,
         rate_limit: float = 2.0,
         db_path: str = "data/mcf_jobs.db",
+        max_rate_limit_retries: int = 4,
+        cooldown_seconds: float = 30.0,
+        discover_bounds: bool = True,
     ) -> int:
         """
         Spawn a subprocess to run the scraper in the background.
@@ -140,6 +143,9 @@ class ScraperDaemon:
             all_years: If True, scrape all years (2019-2026)
             rate_limit: Requests per second
             db_path: Path to SQLite database
+            max_rate_limit_retries: Per-sequence retry cap for 429s
+            cooldown_seconds: Global cooldown after repeated 429s
+            discover_bounds: Whether to discover tighter year bounds before scanning
 
         Returns:
             PID of the daemon process
@@ -156,11 +162,14 @@ class ScraperDaemon:
             sys.executable, "-m", "src.cli", "_daemon-worker",
             "--db", db_path,
             "--rate-limit", str(rate_limit),
+            "--max-rate-limit-retries", str(max_rate_limit_retries),
+            "--cooldown-seconds", str(cooldown_seconds),
             "--pidfile", str(self.pidfile),
             "--logfile", str(self.logfile),
             "--heartbeat-interval", str(self.heartbeat_interval),
             "--wake-threshold", str(self.wake_threshold),
         ]
+        cmd.append("--discover-bounds" if discover_bounds else "--no-discover-bounds")
         if year is not None:
             cmd.extend(["--year", str(year)])
         elif all_years:
