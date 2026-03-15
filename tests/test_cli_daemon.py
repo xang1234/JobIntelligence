@@ -17,11 +17,6 @@ def test_daemon_start_uses_read_only_database(monkeypatch, temp_dir: Path):
     calls: dict[str, object] = {}
 
     class FakeDB:
-        @staticmethod
-        def can_acquire_write_lock(path: str, timeout_ms: int = 1000) -> bool:
-            calls["lock_probe"] = (path, timeout_ms)
-            return True
-
         def __init__(self, path: str, read_only: bool = False):
             calls["db_path"] = path
             calls["read_only"] = read_only
@@ -45,7 +40,6 @@ def test_daemon_start_uses_read_only_database(monkeypatch, temp_dir: Path):
     )
 
     assert result.exit_code == 0
-    assert calls["lock_probe"] == (str(db_path), 1000)
     assert calls["db_path"] == str(db_path)
     assert calls["read_only"] is True
     assert calls["start_kwargs"] == {
@@ -101,22 +95,20 @@ def test_daemon_worker_skips_schema_on_locked_existing_database(
 
 
 def test_daemon_start_fails_cleanly_when_database_is_busy(monkeypatch, temp_dir: Path):
-    """Start should stop before spawning when another writer holds the DB lock."""
+    """Start should surface daemon startup failures cleanly."""
     db_path = temp_dir / "test.db"
-    calls: dict[str, object] = {}
 
     class FakeDB:
-        @staticmethod
-        def can_acquire_write_lock(path: str, timeout_ms: int = 1000) -> bool:
-            calls["lock_probe"] = (path, timeout_ms)
-            return False
-
         def __init__(self, path: str, read_only: bool = False):
-            raise AssertionError("DB should not be constructed when locked")
+            self.path = path
+            self.read_only = read_only
 
     class FakeDaemon:
         def __init__(self, db):
-            raise AssertionError("Daemon should not be constructed when locked")
+            self.db = db
+
+        def start(self, **kwargs):
+            raise cli.DaemonError("Database is busy: another process is writing to it")
 
     monkeypatch.setattr(cli, "MCFDatabase", FakeDB)
     monkeypatch.setattr(cli, "ScraperDaemon", FakeDaemon)
@@ -127,5 +119,4 @@ def test_daemon_start_fails_cleanly_when_database_is_busy(monkeypatch, temp_dir:
     )
 
     assert result.exit_code == 1
-    assert calls["lock_probe"] == (str(db_path), 1000)
     assert "Database is busy" in result.stdout

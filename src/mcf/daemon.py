@@ -98,29 +98,77 @@ class ScraperDaemon:
         self.pidfile.parent.mkdir(parents=True, exist_ok=True)
         self.logfile.parent.mkdir(parents=True, exist_ok=True)
 
-    def is_running(self) -> bool:
-        """Check if daemon is currently running."""
-        if not self.pidfile.exists():
-            return False
-
-        try:
-            pid = int(self.pidfile.read_text().strip())
-            # Check if process exists (signal 0 doesn't kill, just checks)
-            os.kill(pid, 0)
-            return True
-        except (ValueError, ProcessLookupError, PermissionError):
-            # PID file exists but process doesn't - stale PID file
-            self.pidfile.unlink(missing_ok=True)
-            return False
-
-    def get_pid(self) -> int | None:
-        """Get PID of running daemon, or None if not running."""
+    def _pid_from_pidfile(self) -> int | None:
+        """Read the PID file if present and parseable."""
         if not self.pidfile.exists():
             return None
         try:
             return int(self.pidfile.read_text().strip())
         except (ValueError, FileNotFoundError):
             return None
+
+    def _process_exists(self, pid: int) -> bool:
+        """Check whether a PID is still alive."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
+    def _find_worker_pids(self) -> list[int]:
+        """Locate daemon workers that match this pidfile/logfile pair."""
+        try:
+            result = subprocess.run(
+                ["ps", "-ax", "-o", "pid=,command="],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except Exception:
+            return []
+
+        pidfile_arg = f"--pidfile {self.pidfile}"
+        logfile_arg = f"--logfile {self.logfile}"
+        matches: list[int] = []
+
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            pid_str, _, command = stripped.partition(" ")
+            if not pid_str.isdigit():
+                continue
+            if "src.cli _daemon-worker" not in command:
+                continue
+            if pidfile_arg not in command or logfile_arg not in command:
+                continue
+            matches.append(int(pid_str))
+
+        return matches
+
+    def is_running(self) -> bool:
+        """Check if daemon is currently running."""
+        pid = self._pid_from_pidfile()
+        if pid is not None:
+            if self._process_exists(pid):
+                return True
+            self.pidfile.unlink(missing_ok=True)
+
+        return bool(self._find_worker_pids())
+
+    def get_pid(self) -> int | None:
+        """Get PID of running daemon, or None if not running."""
+        pid = self._pid_from_pidfile()
+        if pid is not None and self._process_exists(pid):
+            return pid
+
+        if pid is not None:
+            self.pidfile.unlink(missing_ok=True)
+
+        matches = self._find_worker_pids()
+        if not matches:
+            return None
+        return matches[0]
 
     def start(
         self,
@@ -156,6 +204,8 @@ class ScraperDaemon:
         if self.is_running():
             pid = self.get_pid()
             raise DaemonAlreadyRunning(f"Daemon already running with PID {pid}")
+        if not self.db.can_acquire_write_lock(db_path):
+            raise DaemonError("Database is busy: another process is writing to it")
 
         # Build command for the worker subprocess
         cmd = [
@@ -308,37 +358,38 @@ class ScraperDaemon:
         if not self.is_running():
             raise DaemonNotRunning("No daemon is running")
 
-        pid = self.get_pid()
-        if not pid:
+        pid_from_file = self._pid_from_pidfile()
+        if pid_from_file is not None and self._process_exists(pid_from_file):
+            target_pids = [pid_from_file]
+        else:
+            target_pids = self._find_worker_pids()
+
+        if not target_pids:
             raise DaemonNotRunning("No daemon is running")
 
-        logger.info(f"Stopping daemon (PID {pid})...")
+        for pid in target_pids:
+            logger.info(f"Stopping daemon (PID {pid})...")
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
 
-        # Send SIGTERM for graceful shutdown
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            # Process already gone
-            self.pidfile.unlink(missing_ok=True)
-            return True
-
-        # Wait for process to exit
         for _ in range(timeout):
             time.sleep(1)
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                # Process exited
+            remaining = [pid for pid in target_pids if self._process_exists(pid)]
+            if not remaining:
                 self.pidfile.unlink(missing_ok=True)
                 return True
+            target_pids = remaining
 
-        # Process didn't exit - force kill
-        logger.warning(f"Daemon didn't exit gracefully, sending SIGKILL...")
-        try:
-            os.kill(pid, signal.SIGKILL)
-            time.sleep(0.5)
-        except ProcessLookupError:
-            pass
+        for pid in target_pids:
+            logger.warning(f"Daemon didn't exit gracefully, sending SIGKILL to PID {pid}...")
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        time.sleep(0.5)
 
         self.pidfile.unlink(missing_ok=True)
         return True

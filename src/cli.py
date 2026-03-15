@@ -31,6 +31,7 @@ from src.mcf import (
     HistoricalScraper,
     YEAR_ESTIMATES,
     ScraperDaemon,
+    DaemonError,
     DaemonAlreadyRunning,
     DaemonNotRunning,
     DEFAULT_HEARTBEAT_INTERVAL,
@@ -1083,10 +1084,6 @@ def daemon_cmd(
         if not year and not all_years:
             console.print("[red]Error: Must specify --year or --all for start action[/red]")
             raise typer.Exit(1)
-        if not MCFDatabase.can_acquire_write_lock(db_path):
-            console.print("[red]Database is busy: another process is writing to it[/red]")
-            console.print("Stop the other scrape process before starting the daemon.")
-            raise typer.Exit(1)
         db = MCFDatabase(db_path, read_only=True)
         daemon = ScraperDaemon(db)
 
@@ -1122,6 +1119,10 @@ def daemon_cmd(
         except DaemonAlreadyRunning as e:
             console.print(f"[yellow]{e}[/yellow]")
             console.print("Use [bold]mcf daemon stop[/bold] first")
+            raise typer.Exit(1)
+        except DaemonError as e:
+            console.print(f"[red]{e}[/red]")
+            console.print("Stop the other scrape process before starting the daemon.")
             raise typer.Exit(1)
 
     elif action == "stop":
