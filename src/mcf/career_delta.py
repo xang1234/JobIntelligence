@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 from .industry_taxonomy import IndustryClassification, industry_distance, is_adjacent_role, normalize_title_family
 
@@ -91,6 +92,20 @@ class ScenarioConfidence:
     evidence_coverage: float = 0.0
     market_sample_size: int = 0
     reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScenarioScoreBreakdown:
+    """Composite ranking components for a scenario."""
+
+    opportunity: float = 0.0
+    quality: float = 0.0
+    salary: float = 0.0
+    momentum: float = 0.0
+    diversity: float = 0.0
+    raw_score: float = 0.0
+    pivot_cost: float = 0.0
+    final_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -245,6 +260,7 @@ class ScenarioSummary:
     summary: str
     market_position: MarketPosition
     confidence: ScenarioConfidence
+    score_breakdown: Optional[ScenarioScoreBreakdown] = None
     change: Optional[ScenarioChange] = None
     signals: tuple[ScenarioSignal, ...] = ()
     target_title: Optional[str] = None
@@ -269,6 +285,7 @@ class ScenarioDetail:
     narrative: str
     market_position: MarketPosition
     confidence: ScenarioConfidence
+    score_breakdown: Optional[ScenarioScoreBreakdown] = None
     summary: Optional[ScenarioSummary] = None
     change: Optional[ScenarioChange] = None
     signals: tuple[ScenarioSignal, ...] = ()
@@ -341,6 +358,14 @@ class CareerDeltaDependencies:
     search_scoring: Optional[SearchScoringProvider] = None
 
 
+@dataclass(frozen=True)
+class ComputeBudget:
+    """Soft compute limits for scenario scoring."""
+
+    max_wall_time_ms: int = 5000
+    max_scenarios_evaluated: int = 20
+
+
 class CareerDeltaEngine:
     """
     Internal orchestrator skeleton.
@@ -350,8 +375,16 @@ class CareerDeltaEngine:
     downstream tasks will populate.
     """
 
-    def __init__(self, dependencies: Optional[CareerDeltaDependencies] = None):
+    def __init__(
+        self,
+        dependencies: Optional[CareerDeltaDependencies] = None,
+        *,
+        budget: ComputeBudget = ComputeBudget(),
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self.dependencies = dependencies or CareerDeltaDependencies()
+        self.budget = budget
+        self.clock = clock
 
     def analyze(self, request: CareerDeltaRequest) -> CareerDeltaResponse:
         """
@@ -399,7 +432,8 @@ class CareerDeltaEngine:
             market_snapshot=market_snapshot,
             target_salary_min=normalized_request.target_salary_min,
         )
-        summaries = generate_skill_scenarios(
+        started_at = self.clock()
+        skill_summaries = generate_skill_scenarios(
             normalized_request,
             candidate_pool,
             baseline,
@@ -413,15 +447,24 @@ class CareerDeltaEngine:
             market_snapshot=market_snapshot,
             market_stats=self.dependencies.market_stats,
         )
-        all_summaries = _rank_summaries(summaries + pivot_summaries)
+        raw_summaries = tuple(skill_summaries + pivot_summaries)
+        ranked_summaries, ranking_filtered, budget_degraded = rank_and_filter_scenarios(
+            raw_summaries,
+            baseline=baseline,
+            request=normalized_request,
+            budget=self.budget,
+            started_at=started_at,
+            clock=self.clock,
+        )
+        filtered_union = tuple(filtered_scenarios + ranking_filtered)
 
         return CareerDeltaResponse(
             request=normalized_request,
             baseline=baseline,
             candidate_pool=candidate_pool,
-            summaries=all_summaries,
-            filtered_scenarios=filtered_scenarios if normalized_request.include_filtered else (),
-            degraded=bool(candidate_pool.degraded),
+            summaries=ranked_summaries,
+            filtered_scenarios=filtered_union[:3] if normalized_request.include_filtered else (),
+            degraded=bool(candidate_pool.degraded or budget_degraded),
             thin_market=baseline.thin_market,
         )
 
@@ -648,6 +691,13 @@ MIN_INDUSTRY_PIVOT_FIT = 0.55
 MIN_TITLE_MARKET_IMPROVEMENT = 0.03
 MIN_INDUSTRY_MARKET_IMPROVEMENT = 0.03
 MAX_ADJACENT_INDUSTRY_DISTANCE = 1
+MIN_SCENARIO_SIGNAL = 2
+SEMANTIC_DEDUP_THRESHOLD = 0.7
+WEIGHT_OPPORTUNITY = 0.30
+WEIGHT_QUALITY = 0.25
+WEIGHT_SALARY = 0.20
+WEIGHT_MOMENTUM = 0.15
+WEIGHT_DIVERSITY = 0.10
 
 
 def generate_skill_scenarios(
@@ -1491,7 +1541,7 @@ def _rank_summaries(summaries: tuple[ScenarioSummary, ...]) -> tuple[ScenarioSum
         sorted(
             summaries,
             key=lambda summary: (
-                summary.confidence.score,
+                summary.score_breakdown.final_score if summary.score_breakdown else summary.confidence.score,
                 summary.expected_salary_delta_pct or 0.0,
                 summary.title,
             ),
@@ -1534,6 +1584,375 @@ def _has_material_improvement(
     if _market_delta(target_market.momentum, current_market.momentum) >= threshold:
         return True
     return (salary_lift_pct or 0.0) >= threshold
+
+
+def rank_and_filter_scenarios(
+    summaries: tuple[ScenarioSummary, ...],
+    *,
+    baseline: BaselineMarketPosition,
+    request: CareerDeltaRequest,
+    budget: ComputeBudget,
+    started_at: float,
+    clock: Callable[[], float],
+) -> tuple[tuple[ScenarioSummary, ...], tuple[FilteredScenario, ...], bool]:
+    """Rank raw scenarios, prune duplicates, enforce diversity, and honor budget."""
+    filtered: list[FilteredScenario] = []
+    deduped = _dedupe_scenarios(summaries, filtered)
+    ranked_candidates, budget_degraded = _score_scenarios(
+        deduped,
+        baseline=baseline,
+        budget=budget,
+        started_at=started_at,
+        clock=clock,
+        filtered=filtered,
+    )
+    diversified = _enforce_diversity(ranked_candidates, limit=request.limit)
+    final_ranked = _rank_summaries(tuple(diversified[: request.limit]))
+    return final_ranked, tuple(filtered[:3]), budget_degraded
+
+
+def _dedupe_scenarios(
+    summaries: tuple[ScenarioSummary, ...],
+    filtered: list[FilteredScenario],
+) -> list[ScenarioSummary]:
+    exact_kept: list[ScenarioSummary] = []
+    exact_by_fingerprint: dict[tuple[str, ...], ScenarioSummary] = {}
+    for summary in summaries:
+        fingerprint = _scenario_fingerprint(summary)
+        current = exact_by_fingerprint.get(fingerprint)
+        if current is None:
+            exact_by_fingerprint[fingerprint] = summary
+            exact_kept.append(summary)
+            continue
+        preferred, rejected = _prefer_actionable(current, summary)
+        exact_by_fingerprint[fingerprint] = preferred
+        if rejected is current:
+            exact_kept = [preferred if item is current else item for item in exact_kept]
+        filtered.append(
+            build_filtered_scenario(
+                scenario_type=rejected.scenario_type,
+                reason_code="duplicate_scenario",
+                explanation="A lower-cost scenario with the same changes was kept instead.",
+                confidence=rejected.confidence,
+                source_title_family=rejected.change.source_title_family if rejected.change else None,
+                target_title_family=rejected.change.target_title_family if rejected.change else None,
+                target_sector=rejected.change.target_industry if rejected.change else rejected.target_sector,
+                market_position=rejected.market_position,
+            )
+        )
+
+    semantic_kept: list[ScenarioSummary] = []
+    for summary in exact_kept:
+        matched = next(
+            (
+                existing
+                for existing in semantic_kept
+                if _fingerprint_similarity(_scenario_fingerprint(summary), _scenario_fingerprint(existing))
+                >= SEMANTIC_DEDUP_THRESHOLD
+            ),
+            None,
+        )
+        if matched is None:
+            semantic_kept.append(summary)
+            continue
+        preferred, rejected = _prefer_actionable(matched, summary)
+        if rejected is matched:
+            semantic_kept = [preferred if item is matched else item for item in semantic_kept]
+        filtered.append(
+            build_filtered_scenario(
+                scenario_type=rejected.scenario_type,
+                reason_code="overlapping_scenario",
+                explanation="A materially overlapping scenario with lower pivot cost was kept instead.",
+                confidence=rejected.confidence,
+                source_title_family=rejected.change.source_title_family if rejected.change else None,
+                target_title_family=rejected.change.target_title_family if rejected.change else None,
+                target_sector=rejected.change.target_industry if rejected.change else rejected.target_sector,
+                market_position=rejected.market_position,
+            )
+        )
+    return semantic_kept
+
+
+def _score_scenarios(
+    summaries: list[ScenarioSummary],
+    *,
+    baseline: BaselineMarketPosition,
+    budget: ComputeBudget,
+    started_at: float,
+    clock: Callable[[], float],
+    filtered: list[FilteredScenario],
+) -> tuple[list[ScenarioSummary], bool]:
+    prioritized = sorted(
+        summaries,
+        key=lambda summary: (
+            _scenario_type_priority(summary.scenario_type),
+            -summary.confidence.score,
+            summary.title,
+        ),
+    )
+    evaluated: list[ScenarioSummary] = []
+    metrics_by_id: dict[str, dict[str, float]] = {}
+    budget_degraded = False
+    for index, summary in enumerate(prioritized):
+        if index >= budget.max_scenarios_evaluated or ((clock() - started_at) * 1000) >= budget.max_wall_time_ms:
+            budget_degraded = True
+            filtered.append(
+                build_filtered_scenario(
+                    scenario_type=summary.scenario_type,
+                    reason_code="budget_exhausted",
+                    explanation="Scenario evaluation stopped early to stay within the compute budget.",
+                    confidence=summary.confidence,
+                    source_title_family=summary.change.source_title_family if summary.change else None,
+                    target_title_family=summary.change.target_title_family if summary.change else None,
+                    target_sector=summary.change.target_industry if summary.change else summary.target_sector,
+                    market_position=summary.market_position,
+                )
+            )
+            continue
+        signal_support = _scenario_supporting_jobs(summary)
+        if signal_support < MIN_SCENARIO_SIGNAL:
+            filtered.append(
+                build_filtered_scenario(
+                    scenario_type=summary.scenario_type,
+                    reason_code="low_signal",
+                    explanation="Scenario evidence is too sparse for a stable recommendation.",
+                    confidence=summary.confidence,
+                    source_title_family=summary.change.source_title_family if summary.change else None,
+                    target_title_family=summary.change.target_title_family if summary.change else None,
+                    target_sector=summary.change.target_industry if summary.change else summary.target_sector,
+                    market_position=summary.market_position,
+                )
+            )
+            continue
+        evaluated.append(summary)
+        metrics_by_id[summary.scenario_id] = _scenario_metrics(summary, baseline)
+
+    if not evaluated:
+        return [], budget_degraded
+
+    normalized = _normalize_metrics(metrics_by_id)
+    ranked: list[ScenarioSummary] = []
+    for summary in evaluated:
+        metrics = normalized[summary.scenario_id]
+        pivot_cost = _estimate_pivot_cost(summary)
+        raw_score = (
+            WEIGHT_OPPORTUNITY * metrics["opportunity"]
+            + WEIGHT_QUALITY * metrics["quality"]
+            + WEIGHT_SALARY * metrics["salary"]
+            + WEIGHT_MOMENTUM * metrics["momentum"]
+            + WEIGHT_DIVERSITY * metrics["diversity"]
+        )
+        final_score = round(raw_score * (1.0 - pivot_cost), 4)
+        score_breakdown = ScenarioScoreBreakdown(
+            opportunity=metrics["opportunity"],
+            quality=metrics["quality"],
+            salary=metrics["salary"],
+            momentum=metrics["momentum"],
+            diversity=metrics["diversity"],
+            raw_score=round(raw_score, 4),
+            pivot_cost=pivot_cost,
+            final_score=final_score,
+        )
+        confidence = ScenarioConfidence(
+            score=final_score,
+            evidence_coverage=summary.confidence.evidence_coverage,
+            market_sample_size=summary.confidence.market_sample_size,
+            reasons=summary.confidence.reasons + (f"pivot cost {pivot_cost:.2f}",),
+        )
+        ranked.append(
+            ScenarioSummary(
+                scenario_id=summary.scenario_id,
+                scenario_type=summary.scenario_type,
+                title=summary.title,
+                summary=summary.summary,
+                market_position=summary.market_position,
+                confidence=confidence,
+                score_breakdown=score_breakdown,
+                change=summary.change,
+                signals=summary.signals,
+                target_title=summary.target_title,
+                target_sector=summary.target_sector,
+                thin_market=summary.thin_market,
+                degraded=summary.degraded or budget_degraded,
+                expected_salary_delta_pct=summary.expected_salary_delta_pct,
+            )
+        )
+    return list(_rank_summaries(tuple(ranked))), budget_degraded
+
+
+def _enforce_diversity(summaries: list[ScenarioSummary], *, limit: int) -> list[ScenarioSummary]:
+    if limit <= 0:
+        return []
+    by_type: dict[ScenarioType, list[ScenarioSummary]] = {}
+    for summary in summaries:
+        by_type.setdefault(summary.scenario_type, []).append(summary)
+    for bucket in by_type.values():
+        bucket.sort(
+            key=lambda item: (
+                item.score_breakdown.final_score if item.score_breakdown else item.confidence.score,
+                item.title,
+            ),
+            reverse=True,
+        )
+    selected: list[ScenarioSummary] = []
+    for scenario_type in sorted(by_type.keys(), key=lambda item: _scenario_type_priority(item)):
+        if len(selected) >= limit:
+            break
+        selected.append(by_type[scenario_type].pop(0))
+    remaining = [
+        item
+        for bucket in by_type.values()
+        for item in bucket
+        if item.scenario_id not in {picked.scenario_id for picked in selected}
+    ]
+    remaining.sort(
+        key=lambda item: (
+            item.score_breakdown.final_score if item.score_breakdown else item.confidence.score,
+            item.title,
+        ),
+        reverse=True,
+    )
+    for item in remaining:
+        if len(selected) >= limit:
+            break
+        if item.scenario_id not in {picked.scenario_id for picked in selected}:
+            selected.append(item)
+    return selected
+
+
+def _normalize_metrics(metrics_by_id: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    keys = ("opportunity", "quality", "salary", "momentum", "diversity")
+    normalized: dict[str, dict[str, float]] = {scenario_id: {} for scenario_id in metrics_by_id}
+    for key in keys:
+        ordered = sorted(
+            ((scenario_id, metrics[key]) for scenario_id, metrics in metrics_by_id.items()),
+            key=lambda item: (item[1], item[0]),
+        )
+        total = len(ordered)
+        for index, (scenario_id, _) in enumerate(ordered):
+            score = 1.0 if total == 1 else round(index / (total - 1), 4)
+            normalized[scenario_id][key] = score
+    return normalized
+
+
+def _scenario_metrics(summary: ScenarioSummary, baseline: BaselineMarketPosition) -> dict[str, float]:
+    supporting_jobs = float(_scenario_supporting_jobs(summary))
+    fit_delta = max(_scenario_fit_median(summary) - baseline.fit_median, 0.0)
+    salary = max(summary.expected_salary_delta_pct or 0.0, 0.0)
+    momentum = max(_scenario_momentum(summary), 0.0)
+    diversity = _scenario_diversity_gain(summary)
+    return {
+        "opportunity": supporting_jobs,
+        "quality": fit_delta,
+        "salary": salary,
+        "momentum": momentum,
+        "diversity": diversity,
+    }
+
+
+def _scenario_supporting_jobs(summary: ScenarioSummary) -> int:
+    if not summary.signals:
+        return 0
+    return max(int(getattr(signal, "supporting_jobs", 0)) for signal in summary.signals)
+
+
+def _scenario_fit_median(summary: ScenarioSummary) -> float:
+    if not summary.signals:
+        return summary.confidence.evidence_coverage
+    return max(float(getattr(signal, "fit_median", summary.confidence.evidence_coverage)) for signal in summary.signals)
+
+
+def _scenario_momentum(summary: ScenarioSummary) -> float:
+    if not summary.signals:
+        return 0.0
+    return max(float(getattr(signal, "market_momentum", 0.0) or 0.0) for signal in summary.signals)
+
+
+def _scenario_diversity_gain(summary: ScenarioSummary) -> float:
+    if summary.change and summary.change.source_industry and summary.change.target_industry:
+        return 1.0 if summary.change.source_industry != summary.change.target_industry else 0.4
+    if summary.change and summary.change.target_title_family and summary.change.source_title_family:
+        return 0.35 if summary.change.target_title_family != summary.change.source_title_family else 0.1
+    return 0.1
+
+
+def _scenario_type_priority(scenario_type: ScenarioType) -> int:
+    priorities = {
+        ScenarioType.SKILL_ADDITION: 0,
+        ScenarioType.SKILL_SUBSTITUTION: 1,
+        ScenarioType.TITLE_PIVOT: 2,
+        ScenarioType.SAME_ROLE_INDUSTRY_PIVOT: 3,
+        ScenarioType.ADJACENT_ROLE_INDUSTRY_PIVOT: 4,
+    }
+    return priorities.get(scenario_type, 9)
+
+
+def _estimate_pivot_cost(summary: ScenarioSummary) -> float:
+    if summary.scenario_type == ScenarioType.SKILL_ADDITION:
+        skill_cost = 0.05 * len(summary.change.added_skills) if summary.change else 0.05
+        return min(round(0.03 + skill_cost, 4), 0.95)
+    if summary.scenario_type == ScenarioType.SKILL_SUBSTITUTION:
+        similarity = (
+            max(float(getattr(signal, "similarity", 0.0) or 0.0) for signal in summary.signals)
+            if summary.signals
+            else 0.0
+        )
+        return min(round(0.18 - (similarity * 0.08), 4), 0.95)
+    if summary.scenario_type == ScenarioType.TITLE_PIVOT:
+        return 0.28
+    if summary.scenario_type == ScenarioType.SAME_ROLE_INDUSTRY_PIVOT:
+        return min(round(0.12 + (_industry_distance_cost(summary) * 0.3), 4), 0.95)
+    if summary.scenario_type == ScenarioType.ADJACENT_ROLE_INDUSTRY_PIVOT:
+        return min(round(0.28 + (_industry_distance_cost(summary) * 0.35) + 0.12, 4), 0.95)
+    return 0.4
+
+
+def _industry_distance_cost(summary: ScenarioSummary) -> float:
+    if not summary.signals:
+        return 0.0
+    distance = max(int(getattr(signal, "industry_distance", 0) or 0) for signal in summary.signals)
+    return {0: 0.0, 1: 0.15, 2: 0.5, 3: 0.7}.get(distance, 0.7)
+
+
+def _scenario_fingerprint(summary: ScenarioSummary) -> tuple[str, ...]:
+    change = summary.change
+    if change is None:
+        return (summary.scenario_type.value, summary.scenario_id)
+    parts = [summary.scenario_type.value]
+    parts.extend(f"add:{skill.lower()}" for skill in change.added_skills)
+    parts.extend(f"remove:{skill.lower()}" for skill in change.removed_skills)
+    parts.extend(
+        f"replace:{replacement.from_skill.lower()}->{replacement.to_skill.lower()}"
+        for replacement in change.replaced_skills
+    )
+    if change.source_title_family:
+        parts.append(f"source_title:{change.source_title_family}")
+    if change.target_title_family:
+        parts.append(f"target_title:{change.target_title_family}")
+    if change.source_industry:
+        parts.append(f"source_industry:{change.source_industry}")
+    if change.target_industry:
+        parts.append(f"target_industry:{change.target_industry}")
+    return tuple(sorted(parts))
+
+
+def _fingerprint_similarity(left: tuple[str, ...], right: tuple[str, ...]) -> float:
+    left_set = set(left)
+    right_set = set(right)
+    union = left_set | right_set
+    if not union:
+        return 0.0
+    return len(left_set & right_set) / len(union)
+
+
+def _prefer_actionable(left: ScenarioSummary, right: ScenarioSummary) -> tuple[ScenarioSummary, ScenarioSummary]:
+    left_cost = _estimate_pivot_cost(left)
+    right_cost = _estimate_pivot_cost(right)
+    if left_cost != right_cost:
+        return (left, right) if left_cost < right_cost else (right, left)
+    if left.confidence.score != right.confidence.score:
+        return (left, right) if left.confidence.score >= right.confidence.score else (right, left)
+    return (left, right) if left.scenario_id <= right.scenario_id else (right, left)
 
 
 def _dedupe_substitution_summaries(

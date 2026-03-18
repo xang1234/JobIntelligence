@@ -1,15 +1,22 @@
 from src.mcf.career_delta import (
+    BaselineMarketPosition,
     CareerDeltaCandidate,
     CareerDeltaCandidatePool,
     CareerDeltaDependencies,
     CareerDeltaEngine,
     CareerDeltaRequest,
+    ComputeBudget,
     MarketPosition,
+    PivotScenarioSignal,
+    SalaryBand,
     ScenarioChange,
     ScenarioConfidence,
+    ScenarioSummary,
     ScenarioType,
+    SkillScenarioSignal,
     build_filtered_scenario,
     build_scenario_id,
+    rank_and_filter_scenarios,
 )
 from src.mcf.market_stats import MarketAggregate
 
@@ -904,3 +911,245 @@ class TestCareerDeltaEngine:
 
         assert filtered.scenario_id.startswith("industry_pivot:")
         assert filtered.reason_code == "low_evidence"
+
+
+class TestScenarioRanking:
+    def test_ranker_prunes_exact_duplicates_predictably(self):
+        duplicate_a = ScenarioSummary(
+            scenario_id="skill_addition:a",
+            scenario_type=ScenarioType.SKILL_ADDITION,
+            title="Add Kubernetes",
+            summary="Add Kubernetes",
+            market_position=MarketPosition.COMPETITIVE,
+            confidence=ScenarioConfidence(score=0.8, evidence_coverage=0.6, market_sample_size=20),
+            change=ScenarioChange(added_skills=("Kubernetes",)),
+            signals=(
+                SkillScenarioSignal(
+                    skill="Kubernetes",
+                    supporting_jobs=4,
+                    supporting_share_pct=50.0,
+                    market_job_count=30,
+                    market_momentum=0.1,
+                    salary_lift_pct=0.1,
+                ),
+            ),
+            expected_salary_delta_pct=0.1,
+        )
+        duplicate_b = ScenarioSummary(
+            scenario_id="skill_addition:b",
+            scenario_type=ScenarioType.SKILL_ADDITION,
+            title="Add Kubernetes",
+            summary="Add Kubernetes",
+            market_position=MarketPosition.COMPETITIVE,
+            confidence=ScenarioConfidence(score=0.6, evidence_coverage=0.5, market_sample_size=18),
+            change=ScenarioChange(added_skills=("Kubernetes",)),
+            signals=(
+                SkillScenarioSignal(
+                    skill="Kubernetes",
+                    supporting_jobs=3,
+                    supporting_share_pct=40.0,
+                    market_job_count=28,
+                    market_momentum=0.08,
+                    salary_lift_pct=0.08,
+                ),
+            ),
+            expected_salary_delta_pct=0.08,
+        )
+
+        ranked, filtered, degraded = rank_and_filter_scenarios(
+            (duplicate_a, duplicate_b),
+            baseline=BaselineMarketPosition(
+                position=MarketPosition.COMPETITIVE,
+                reachable_jobs=12,
+                total_candidates=20,
+                fit_median=0.6,
+                fit_p90=0.75,
+                salary_band=SalaryBand(median_annual=120000),
+            ),
+            request=CareerDeltaRequest(profile_text="Profile", limit=5),
+            budget=ComputeBudget(),
+            started_at=0.0,
+            clock=lambda: 0.0,
+        )
+
+        assert degraded is False
+        assert len(ranked) == 1
+        assert ranked[0].scenario_id == "skill_addition:a"
+        assert filtered[0].reason_code == "duplicate_scenario"
+
+    def test_ranker_enforces_type_diversity_before_fill(self):
+        baseline = BaselineMarketPosition(
+            position=MarketPosition.COMPETITIVE,
+            reachable_jobs=12,
+            total_candidates=20,
+            fit_median=0.55,
+            fit_p90=0.75,
+            salary_band=SalaryBand(median_annual=120000),
+        )
+        summaries = (
+            ScenarioSummary(
+                scenario_id="skill:1",
+                scenario_type=ScenarioType.SKILL_ADDITION,
+                title="Add Kubernetes",
+                summary="Add Kubernetes",
+                market_position=MarketPosition.COMPETITIVE,
+                confidence=ScenarioConfidence(score=0.9, evidence_coverage=0.6, market_sample_size=20),
+                change=ScenarioChange(added_skills=("Kubernetes",)),
+                signals=(SkillScenarioSignal("Kubernetes", 5, 50.0, 30, market_momentum=0.15, salary_lift_pct=0.12),),
+                expected_salary_delta_pct=0.12,
+            ),
+            ScenarioSummary(
+                scenario_id="skill:2",
+                scenario_type=ScenarioType.SKILL_ADDITION,
+                title="Add Terraform",
+                summary="Add Terraform",
+                market_position=MarketPosition.COMPETITIVE,
+                confidence=ScenarioConfidence(score=0.88, evidence_coverage=0.55, market_sample_size=18),
+                change=ScenarioChange(added_skills=("Terraform",)),
+                signals=(SkillScenarioSignal("Terraform", 4, 40.0, 26, market_momentum=0.12, salary_lift_pct=0.1),),
+                expected_salary_delta_pct=0.1,
+            ),
+            ScenarioSummary(
+                scenario_id="pivot:1",
+                scenario_type=ScenarioType.TITLE_PIVOT,
+                title="Pivot toward Data Scientist",
+                summary="Pivot",
+                market_position=MarketPosition.STRETCH,
+                confidence=ScenarioConfidence(score=0.7, evidence_coverage=0.4, market_sample_size=22),
+                change=ScenarioChange(source_title_family="data-analyst", target_title_family="data-scientist"),
+                signals=(
+                    PivotScenarioSignal(
+                        supporting_jobs=4,
+                        supporting_share_pct=40.0,
+                        target_title_family="data-scientist",
+                        target_industry="technology/data_and_ai",
+                        title_distance="adjacent",
+                        industry_distance=0,
+                        fit_median=0.68,
+                        market_job_count=22,
+                        market_momentum=0.09,
+                        salary_lift_pct=0.08,
+                    ),
+                ),
+                expected_salary_delta_pct=0.08,
+            ),
+        )
+
+        ranked, _, _ = rank_and_filter_scenarios(
+            summaries,
+            baseline=baseline,
+            request=CareerDeltaRequest(profile_text="Profile", limit=2),
+            budget=ComputeBudget(),
+            started_at=0.0,
+            clock=lambda: 0.0,
+        )
+
+        assert len(ranked) == 2
+        assert {item.scenario_type for item in ranked} == {
+            ScenarioType.SKILL_ADDITION,
+            ScenarioType.TITLE_PIVOT,
+        }
+
+    def test_engine_marks_response_degraded_when_budget_truncates_scoring(self):
+        pool = CareerDeltaCandidatePool(
+            candidates=(
+                _candidate(uuid="1", skills=("Python", "SQL", "Kubernetes"), gap_skills=("Kubernetes",)),
+                _candidate(
+                    uuid="2",
+                    skills=("Python", "SQL", "Kubernetes", "Terraform"),
+                    gap_skills=("Kubernetes", "Terraform"),
+                ),
+                _candidate(
+                    uuid="3",
+                    title="Data Scientist",
+                    title_family="data-scientist",
+                    industry_key="technology/data_and_ai",
+                    industry_label="technology / data_and_ai",
+                    overall_fit=0.69,
+                ),
+                _candidate(
+                    uuid="4",
+                    title="Data Scientist",
+                    title_family="data-scientist",
+                    industry_key="technology/data_and_ai",
+                    industry_label="technology / data_and_ai",
+                    overall_fit=0.67,
+                ),
+            ),
+            extracted_skills=("Python", "SQL"),
+            total_candidates=20,
+        )
+        dependencies = CareerDeltaDependencies(
+            taxonomy=_TaxonomyStub(),
+            market_stats=_MarketStatsStub(
+                skills={
+                    "Kubernetes": MarketAggregate(
+                        "kubernetes",
+                        "Kubernetes",
+                        "skill",
+                        40,
+                        210000,
+                        0.14,
+                    ),
+                    "Terraform": MarketAggregate(
+                        "terraform",
+                        "Terraform",
+                        "skill",
+                        30,
+                        205000,
+                        0.1,
+                    ),
+                },
+                title_families={
+                    "data-analyst": MarketAggregate(
+                        "data-analyst",
+                        "data-analyst",
+                        "title_family",
+                        20,
+                        120000,
+                        0.03,
+                    ),
+                    "data-scientist": MarketAggregate(
+                        "data-scientist",
+                        "data-scientist",
+                        "title_family",
+                        35,
+                        145000,
+                        0.11,
+                    ),
+                },
+                snapshot={
+                    "current_industry": MarketAggregate(
+                        "technology/data_and_ai",
+                        "technology / data_and_ai",
+                        "industry",
+                        50,
+                    ),
+                    "current_title_family": MarketAggregate(
+                        "data-analyst",
+                        "data-analyst",
+                        "title_family",
+                        20,
+                        120000,
+                        0.03,
+                    ),
+                },
+            ),
+            search_scoring=_SearchScoringStub(pool=pool),
+        )
+
+        response = CareerDeltaEngine(
+            dependencies,
+            budget=ComputeBudget(max_wall_time_ms=5000, max_scenarios_evaluated=1),
+        ).analyze(
+            CareerDeltaRequest(
+                profile_text="Data analyst with Python and SQL experience.",
+                current_title="Data Analyst",
+                current_skills=("Python", "SQL"),
+                limit=3,
+            )
+        )
+
+        assert response.degraded is True
+        assert response.filtered_scenarios
+        assert any(item.reason_code == "budget_exhausted" for item in response.filtered_scenarios)
