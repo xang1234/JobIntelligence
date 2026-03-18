@@ -46,11 +46,7 @@ export default function MatchLabPage() {
   })
 
   const whatIfMutation = useMutation({
-    mutationFn: () => analyzeCareerDelta(
-      buildCareerDeltaAnalysisRequest(inputs, {
-        currentSkills: matchMutation.data?.extracted_skills ?? [],
-      }),
-    ),
+    mutationFn: () => analyzeCareerDelta(buildCareerDeltaAnalysisRequest(inputs)),
   })
 
   const inputsReady = inputs.profileText.trim().length >= 20
@@ -187,11 +183,6 @@ export default function MatchLabPage() {
                   {inputsReady ? 'ready' : 'needs more detail'}
                 </span>
               </span>
-              {matchMutation.data?.extracted_skills.length ? (
-                <span>
-                  {matchMutation.data.extracted_skills.length} extracted skills available for What If reuse
-                </span>
-              ) : null}
             </div>
           </div>
 
