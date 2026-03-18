@@ -162,6 +162,8 @@ class MarketStatsCache:
         for row in rows:
             company_name = (row["company_name"] or "").strip()
             direct = classification_from_bucket(row["industry_bucket"])
+            if direct.is_unknown:
+                direct = classify_industry(self._split_csv(row["categories"]))
             if company_name and not direct.is_unknown:
                 company_direct_industries[company_name].append(direct)
 

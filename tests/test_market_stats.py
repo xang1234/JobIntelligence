@@ -223,3 +223,57 @@ def test_market_stats_use_persisted_normalized_columns_for_aggregates(empty_db):
 
     assert title_aggregate.job_count == 1
     assert industry_aggregate.job_count == 1
+
+
+def test_market_snapshot_preserves_company_fallback_with_missing_persisted_bucket(empty_db):
+    _insert_job(
+        empty_db,
+        title="Platform Engineer",
+        company_name="Alpha",
+        skills=["Python", "AWS"],
+        categories=["Information Technology"],
+        posted_days_ago=2,
+        salary_min=10000,
+        salary_max=13000,
+    )
+    _insert_job(
+        empty_db,
+        title="Analytics Engineer",
+        company_name="Alpha",
+        skills=["SQL"],
+        categories=["Information Technology"],
+        posted_days_ago=5,
+        salary_min=9000,
+        salary_max=12000,
+    )
+    _insert_job(
+        empty_db,
+        title="Site Reliability Engineer",
+        company_name="Alpha",
+        skills=["Kubernetes"],
+        categories=["Information Technology"],
+        posted_days_ago=8,
+        salary_min=11000,
+        salary_max=14000,
+    )
+
+    with empty_db._connection() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET industry_bucket = NULL
+            WHERE company_name = 'Alpha'
+            """
+        )
+
+    cache = MarketStatsCache(empty_db, months=3)
+    snapshot = cache.get_market_snapshot(
+        CareerDeltaRequest(
+            profile_text="Engineer at Alpha",
+            current_company="Alpha",
+            current_skills=(),
+            target_titles=("Platform Engineer",),
+        )
+    )
+
+    assert snapshot["current_industry"].key == "technology/software_and_platforms"
