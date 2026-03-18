@@ -126,6 +126,7 @@ class MarketStatsCache:
             current_industry = company_industry
         else:
             current_industry = classify_industry(
+                (),
                 skills=request.current_skills,
             )
 
