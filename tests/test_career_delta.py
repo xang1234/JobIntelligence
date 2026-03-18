@@ -490,6 +490,108 @@ class TestCareerDeltaEngine:
         assert pivots[0].target_title == "Data Scientist"
         assert pivots[0].change.target_title_family == "data-scientist"
 
+    def test_engine_caps_title_pivots_to_the_single_best_family(self):
+        pool = CareerDeltaCandidatePool(
+            candidates=(
+                _candidate(
+                    uuid="1",
+                    title="Data Scientist",
+                    title_family="data-scientist",
+                    industry_key="technology/data_and_ai",
+                    industry_label="technology / data_and_ai",
+                    overall_fit=0.72,
+                ),
+                _candidate(
+                    uuid="2",
+                    title="Data Scientist",
+                    title_family="data-scientist",
+                    industry_key="technology/data_and_ai",
+                    industry_label="technology / data_and_ai",
+                    overall_fit=0.7,
+                ),
+                _candidate(
+                    uuid="3",
+                    title="Product Manager",
+                    title_family="product-manager",
+                    industry_key="technology/data_and_ai",
+                    industry_label="technology / data_and_ai",
+                    overall_fit=0.66,
+                ),
+                _candidate(
+                    uuid="4",
+                    title="Product Manager",
+                    title_family="product-manager",
+                    industry_key="technology/data_and_ai",
+                    industry_label="technology / data_and_ai",
+                    overall_fit=0.64,
+                ),
+            ),
+            extracted_skills=("Python", "SQL"),
+            total_candidates=24,
+        )
+        dependencies = CareerDeltaDependencies(
+            taxonomy=_TaxonomyStub(),
+            market_stats=_MarketStatsStub(
+                title_families={
+                    "data-analyst": MarketAggregate(
+                        key="data-analyst",
+                        label="data-analyst",
+                        kind="title_family",
+                        job_count=20,
+                        median_salary_annual=120000,
+                        momentum=0.03,
+                    ),
+                    "data-scientist": MarketAggregate(
+                        key="data-scientist",
+                        label="data-scientist",
+                        kind="title_family",
+                        job_count=38,
+                        median_salary_annual=148000,
+                        momentum=0.12,
+                    ),
+                    "product-manager": MarketAggregate(
+                        key="product-manager",
+                        label="product-manager",
+                        kind="title_family",
+                        job_count=26,
+                        median_salary_annual=138000,
+                        momentum=0.07,
+                    ),
+                },
+                snapshot={
+                    "current_industry": MarketAggregate(
+                        key="technology/data_and_ai",
+                        label="technology / data_and_ai",
+                        kind="industry",
+                        job_count=50,
+                    ),
+                    "current_title_family": MarketAggregate(
+                        key="data-analyst",
+                        label="data-analyst",
+                        kind="title_family",
+                        job_count=20,
+                        median_salary_annual=120000,
+                        momentum=0.03,
+                    ),
+                },
+            ),
+            search_scoring=_SearchScoringStub(pool=pool),
+        )
+
+        response = CareerDeltaEngine(dependencies).analyze(
+            CareerDeltaRequest(
+                profile_text="Data analyst with Python and SQL experience.",
+                current_title="Data Analyst",
+                current_skills=("Python", "SQL"),
+                limit=6,
+            )
+        )
+
+        pivots = [summary for summary in response.summaries if summary.scenario_type == ScenarioType.TITLE_PIVOT]
+
+        assert len(pivots) == 1
+        assert pivots[0].change.target_title_family == "data-scientist"
+
     def test_engine_dedupes_unknown_industry_title_pivots_by_title_family(self):
         pool = CareerDeltaCandidatePool(
             candidates=(
@@ -914,6 +1016,77 @@ class TestCareerDeltaEngine:
 
 
 class TestScenarioRanking:
+    def test_ranker_prefers_grounded_skill_addition_over_higher_upside_title_pivot(self):
+        baseline = BaselineMarketPosition(
+            position=MarketPosition.COMPETITIVE,
+            reachable_jobs=12,
+            total_candidates=20,
+            fit_median=0.55,
+            fit_p90=0.75,
+            salary_band=SalaryBand(median_annual=120000),
+        )
+        skill_summary = ScenarioSummary(
+            scenario_id="skill_addition:kubernetes",
+            scenario_type=ScenarioType.SKILL_ADDITION,
+            title="Add Kubernetes",
+            summary="Add Kubernetes to strengthen reachable platform roles.",
+            market_position=MarketPosition.COMPETITIVE,
+            confidence=ScenarioConfidence(score=0.82, evidence_coverage=0.6, market_sample_size=30),
+            change=ScenarioChange(added_skills=("Kubernetes",)),
+            signals=(
+                SkillScenarioSignal(
+                    skill="Kubernetes",
+                    supporting_jobs=5,
+                    supporting_share_pct=40.0,
+                    market_job_count=30,
+                    market_momentum=0.1,
+                    salary_lift_pct=0.08,
+                ),
+            ),
+            expected_salary_delta_pct=0.08,
+        )
+        title_pivot = ScenarioSummary(
+            scenario_id="title_pivot:platform",
+            scenario_type=ScenarioType.TITLE_PIVOT,
+            title="Pivot toward Platform Engineer",
+            summary="Use adjacent-role demand to pivot toward platform engineering.",
+            market_position=MarketPosition.STRETCH,
+            confidence=ScenarioConfidence(score=0.78, evidence_coverage=0.5, market_sample_size=24),
+            change=ScenarioChange(
+                source_title_family="data-engineer",
+                target_title_family="platform-engineer",
+            ),
+            signals=(
+                PivotScenarioSignal(
+                    supporting_jobs=4,
+                    supporting_share_pct=30.0,
+                    target_title_family="platform-engineer",
+                    target_industry="technology/software_and_platforms",
+                    title_distance="adjacent",
+                    industry_distance=0,
+                    fit_median=0.68,
+                    market_job_count=24,
+                    market_momentum=0.14,
+                    salary_lift_pct=0.12,
+                ),
+            ),
+            expected_salary_delta_pct=0.12,
+        )
+
+        ranked, _, _ = rank_and_filter_scenarios(
+            (skill_summary, title_pivot),
+            baseline=baseline,
+            request=CareerDeltaRequest(profile_text="Profile", limit=5),
+            budget=ComputeBudget(),
+            started_at=0.0,
+            clock=lambda: 0.0,
+        )
+
+        assert [summary.scenario_id for summary in ranked] == [
+            "skill_addition:kubernetes",
+            "title_pivot:platform",
+        ]
+
     def test_ranker_prunes_exact_duplicates_predictably(self):
         duplicate_a = ScenarioSummary(
             scenario_id="skill_addition:a",
@@ -1124,6 +1297,88 @@ class TestScenarioRanking:
             ScenarioType.SKILL_ADDITION,
             ScenarioType.TITLE_PIVOT,
         }
+
+    def test_ranker_prefers_same_role_industry_pivot_over_adjacent_role_when_upside_is_similar(self):
+        baseline = BaselineMarketPosition(
+            position=MarketPosition.COMPETITIVE,
+            reachable_jobs=12,
+            total_candidates=20,
+            fit_median=0.55,
+            fit_p90=0.75,
+            salary_band=SalaryBand(median_annual=120000),
+        )
+        same_role = ScenarioSummary(
+            scenario_id="same_role:industry",
+            scenario_type=ScenarioType.SAME_ROLE_INDUSTRY_PIVOT,
+            title="Keep the role, pivot into technology / data_and_ai",
+            summary="Stay in the same role family inside a stronger sector.",
+            market_position=MarketPosition.COMPETITIVE,
+            confidence=ScenarioConfidence(score=0.79, evidence_coverage=0.5, market_sample_size=28),
+            change=ScenarioChange(
+                source_title_family="data-scientist",
+                target_title_family="data-scientist",
+                source_industry="financial_services/banking",
+                target_industry="technology/data_and_ai",
+            ),
+            signals=(
+                PivotScenarioSignal(
+                    supporting_jobs=4,
+                    supporting_share_pct=30.0,
+                    target_title_family="data-scientist",
+                    target_industry="technology/data_and_ai",
+                    title_distance="same",
+                    industry_distance=1,
+                    fit_median=0.67,
+                    market_job_count=28,
+                    market_momentum=0.12,
+                    salary_lift_pct=0.1,
+                ),
+            ),
+            expected_salary_delta_pct=0.1,
+        )
+        adjacent_role = ScenarioSummary(
+            scenario_id="adjacent_role:industry",
+            scenario_type=ScenarioType.ADJACENT_ROLE_INDUSTRY_PIVOT,
+            title="Move toward ML Engineer in technology / data_and_ai",
+            summary="Take an adjacent role and sector move with similar upside.",
+            market_position=MarketPosition.STRETCH,
+            confidence=ScenarioConfidence(score=0.77, evidence_coverage=0.5, market_sample_size=30),
+            change=ScenarioChange(
+                source_title_family="data-scientist",
+                target_title_family="ml-engineer",
+                source_industry="financial_services/banking",
+                target_industry="technology/data_and_ai",
+            ),
+            signals=(
+                PivotScenarioSignal(
+                    supporting_jobs=4,
+                    supporting_share_pct=30.0,
+                    target_title_family="ml-engineer",
+                    target_industry="technology/data_and_ai",
+                    title_distance="adjacent",
+                    industry_distance=1,
+                    fit_median=0.68,
+                    market_job_count=30,
+                    market_momentum=0.13,
+                    salary_lift_pct=0.11,
+                ),
+            ),
+            expected_salary_delta_pct=0.11,
+        )
+
+        ranked, _, _ = rank_and_filter_scenarios(
+            (same_role, adjacent_role),
+            baseline=baseline,
+            request=CareerDeltaRequest(profile_text="Profile", limit=5),
+            budget=ComputeBudget(),
+            started_at=0.0,
+            clock=lambda: 0.0,
+        )
+
+        assert [summary.scenario_id for summary in ranked] == [
+            "same_role:industry",
+            "adjacent_role:industry",
+        ]
 
     def test_engine_marks_response_degraded_when_budget_truncates_scoring(self):
         pool = CareerDeltaCandidatePool(

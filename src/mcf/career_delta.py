@@ -671,9 +671,9 @@ def _salary_midpoint(low: Optional[int], high: Optional[int]) -> Optional[int]:
 
 MAX_SKILL_ADDITION_SCENARIOS = 3
 MAX_SKILL_SUBSTITUTION_SCENARIOS = 3
-MAX_TITLE_PIVOT_SCENARIOS = 2
+MAX_TITLE_PIVOT_SCENARIOS = 1
 MAX_SAME_ROLE_INDUSTRY_PIVOT_SCENARIOS = 2
-MAX_ADJACENT_ROLE_INDUSTRY_PIVOT_SCENARIOS = 2
+MAX_ADJACENT_ROLE_INDUSTRY_PIVOT_SCENARIOS = 1
 RELATED_SKILL_LIMIT = 6
 REACHABLE_FIT_THRESHOLD = 0.55
 MIN_SKILL_SUPPORTING_JOBS = 2
@@ -693,11 +693,18 @@ MIN_INDUSTRY_MARKET_IMPROVEMENT = 0.03
 MAX_ADJACENT_INDUSTRY_DISTANCE = 1
 MIN_SCENARIO_SIGNAL = 2
 SEMANTIC_DEDUP_THRESHOLD = 0.7
-WEIGHT_OPPORTUNITY = 0.30
-WEIGHT_QUALITY = 0.25
-WEIGHT_SALARY = 0.20
-WEIGHT_MOMENTUM = 0.15
-WEIGHT_DIVERSITY = 0.10
+
+# Rollout tuning note:
+# The shortlist should default toward believable, lower-pivot moves rather than
+# letting novelty or salary upside dominate. Evidence volume and fit quality do
+# most of the ranking work; salary and momentum help break ties; diversity is a
+# small nudge so the list is not redundant, not a reason to surface a bigger
+# move by itself.
+WEIGHT_OPPORTUNITY = 0.48
+WEIGHT_QUALITY = 0.22
+WEIGHT_SALARY = 0.13
+WEIGHT_MOMENTUM = 0.12
+WEIGHT_DIVERSITY = 0.05
 
 
 def generate_skill_scenarios(
@@ -1903,11 +1910,11 @@ def _estimate_pivot_cost(summary: ScenarioSummary) -> float:
         )
         return min(round(0.18 - (similarity * 0.08), 4), 0.95)
     if summary.scenario_type == ScenarioType.TITLE_PIVOT:
-        return 0.28
+        return 0.46
     if summary.scenario_type == ScenarioType.SAME_ROLE_INDUSTRY_PIVOT:
-        return min(round(0.12 + (_industry_distance_cost(summary) * 0.3), 4), 0.95)
+        return min(round(0.14 + (_industry_distance_cost(summary) * 0.32), 4), 0.95)
     if summary.scenario_type == ScenarioType.ADJACENT_ROLE_INDUSTRY_PIVOT:
-        return min(round(0.28 + (_industry_distance_cost(summary) * 0.35) + 0.12, 4), 0.95)
+        return min(round(0.32 + (_industry_distance_cost(summary) * 0.38) + 0.14, 4), 0.95)
     return 0.4
 
 
