@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Protocol
@@ -40,6 +41,8 @@ class ScenarioType(str, Enum):
     SAME_ROLE = "same_role"
     ADJACENT_ROLE = "adjacent_role"
     INDUSTRY_PIVOT = "industry_pivot"
+    SKILL_ADDITION = "skill_addition"
+    SKILL_SUBSTITUTION = "skill_substitution"
     FILTERED_OUT = "filtered_out"
 
 
@@ -104,6 +107,38 @@ class SalaryBand:
 
 
 @dataclass(frozen=True)
+class SkillReplacement:
+    """Structured replacement from one current skill to a proposed alternative."""
+
+    from_skill: str
+    to_skill: str
+
+
+@dataclass(frozen=True)
+class ScenarioChange:
+    """Structured skill change payload for generated scenarios."""
+
+    added_skills: tuple[str, ...] = ()
+    removed_skills: tuple[str, ...] = ()
+    replaced_skills: tuple[SkillReplacement, ...] = ()
+
+
+@dataclass(frozen=True)
+class SkillScenarioSignal:
+    """Structured market and adjacency evidence behind a skill scenario."""
+
+    skill: str
+    supporting_jobs: int
+    supporting_share_pct: float
+    market_job_count: int
+    market_salary_annual_median: Optional[int] = None
+    market_momentum: Optional[float] = None
+    salary_lift_pct: Optional[float] = None
+    similarity: Optional[float] = None
+    same_cluster: Optional[bool] = None
+
+
+@dataclass(frozen=True)
 class CareerDeltaCandidate:
     """Per-job evidence retained for later scenario rescoring and detail payloads."""
 
@@ -123,6 +158,7 @@ class CareerDeltaCandidate:
     salary_fit: Optional[float] = None
     matched_skills: tuple[str, ...] = ()
     missing_skills: tuple[str, ...] = ()
+    gap_skills: tuple[str, ...] = ()
     skills: tuple[str, ...] = ()
     categories: tuple[str, ...] = ()
     salary_annual_min: Optional[int] = None
@@ -180,6 +216,8 @@ class ScenarioSummary:
     summary: str
     market_position: MarketPosition
     confidence: ScenarioConfidence
+    change: Optional[ScenarioChange] = None
+    signals: tuple[SkillScenarioSignal, ...] = ()
     target_title: Optional[str] = None
     target_sector: Optional[str] = None
     thin_market: bool = False
@@ -203,6 +241,8 @@ class ScenarioDetail:
     market_position: MarketPosition
     confidence: ScenarioConfidence
     summary: Optional[ScenarioSummary] = None
+    change: Optional[ScenarioChange] = None
+    signals: tuple[SkillScenarioSignal, ...] = ()
     target_title: Optional[str] = None
     target_sector: Optional[str] = None
     evidence: tuple[str, ...] = ()
@@ -249,12 +289,14 @@ class MarketStatsProvider(Protocol):
     """Provider for aggregated market statistics used by scenario generation."""
 
     def get_market_snapshot(self, request: CareerDeltaRequest) -> dict: ...
+    def get_skill_stats(self, skill: str): ...
 
 
 class SearchScoringProvider(Protocol):
     """Provider for wide-pool retrieval and scenario scoring helpers."""
 
     def build_candidate_pool(self, request: CareerDeltaRequest) -> CareerDeltaCandidatePool: ...
+    def get_related_skills(self, skill: str, k: int = 10): ...
 
 
 @dataclass
@@ -326,12 +368,19 @@ class CareerDeltaEngine:
             market_snapshot=market_snapshot,
             target_salary_min=normalized_request.target_salary_min,
         )
+        summaries = generate_skill_scenarios(
+            normalized_request,
+            candidate_pool,
+            baseline,
+            market_stats=self.dependencies.market_stats,
+            search_scoring=self.dependencies.search_scoring,
+        )
 
         return CareerDeltaResponse(
             request=normalized_request,
             baseline=baseline,
             candidate_pool=candidate_pool,
-            summaries=(),
+            summaries=summaries,
             filtered_scenarios=(),
             degraded=bool(candidate_pool.degraded),
             thin_market=baseline.thin_market,
@@ -433,8 +482,7 @@ def summarize_market_position(
     top_skill_gaps = _top_insights(
         gap
         for candidate in analysis_set[:20]
-        for gap in candidate.missing_skills
-        if gap not in candidate.matched_skills
+        for gap in candidate.gap_skills
     )
 
     skill_coverage_values = [
@@ -537,3 +585,337 @@ def _salary_midpoint(low: Optional[int], high: Optional[int]) -> Optional[int]:
     if low is not None:
         return low
     return high
+
+
+MAX_SKILL_ADDITION_SCENARIOS = 3
+MAX_SKILL_SUBSTITUTION_SCENARIOS = 3
+RELATED_SKILL_LIMIT = 6
+REACHABLE_FIT_THRESHOLD = 0.55
+MIN_SKILL_SUPPORTING_JOBS = 2
+MIN_SKILL_SUPPORT_SHARE = 0.18
+MIN_SUBSTITUTION_SIMILARITY = 0.72
+MIN_SUBSTITUTION_JOB_COUNT_RATIO = 1.25
+MIN_SUBSTITUTION_MOMENTUM_DELTA = 0.05
+MIN_SUBSTITUTION_SALARY_LIFT_PCT = 0.08
+
+
+def generate_skill_scenarios(
+    request: CareerDeltaRequest,
+    candidate_pool: CareerDeltaCandidatePool,
+    baseline: BaselineMarketPosition,
+    *,
+    market_stats: MarketStatsProvider,
+    search_scoring: SearchScoringProvider,
+) -> tuple[ScenarioSummary, ...]:
+    """Generate bounded low-pivot skill scenarios from the baseline evidence."""
+    current_skills = _normalize_skill_inventory(
+        tuple(request.current_skills) + tuple(candidate_pool.extracted_skills)
+    )
+    analysis_set = _analysis_candidates(candidate_pool)
+    if not analysis_set:
+        return ()
+
+    addition_summaries = _generate_skill_addition_scenarios(
+        current_skills=current_skills,
+        analysis_set=analysis_set,
+        baseline=baseline,
+        market_stats=market_stats,
+    )
+    substitution_summaries = _generate_skill_substitution_scenarios(
+        current_skills=current_skills,
+        analysis_set=analysis_set,
+        baseline=baseline,
+        market_stats=market_stats,
+        search_scoring=search_scoring,
+    )
+    ranked = sorted(
+        addition_summaries + substitution_summaries,
+        key=lambda summary: (
+            summary.confidence.score,
+            summary.expected_salary_delta_pct or 0.0,
+            summary.title,
+        ),
+        reverse=True,
+    )
+    return tuple(ranked)
+
+
+def _generate_skill_addition_scenarios(
+    *,
+    current_skills: dict[str, str],
+    analysis_set: list[CareerDeltaCandidate],
+    baseline: BaselineMarketPosition,
+    market_stats: MarketStatsProvider,
+) -> list[ScenarioSummary]:
+    support_counts: Counter[str] = Counter()
+    display_names: dict[str, str] = {}
+    total_jobs = len(analysis_set)
+    for candidate in analysis_set:
+        for skill in candidate.gap_skills:
+            key = skill.strip().lower()
+            if not key or key in current_skills:
+                continue
+            support_counts[key] += 1
+            display_names.setdefault(key, skill)
+
+    scored: list[tuple[float, ScenarioSummary]] = []
+    for skill_key, supporting_jobs in support_counts.items():
+        support_share = supporting_jobs / total_jobs if total_jobs else 0.0
+        if supporting_jobs < MIN_SKILL_SUPPORTING_JOBS and support_share < MIN_SKILL_SUPPORT_SHARE:
+            continue
+
+        display_skill = display_names[skill_key]
+        market = market_stats.get_skill_stats(display_skill)
+        salary_lift_pct = _salary_lift_pct(
+            market.median_salary_annual,
+            baseline.salary_band.median_annual,
+        )
+        signal = SkillScenarioSignal(
+            skill=display_skill,
+            supporting_jobs=supporting_jobs,
+            supporting_share_pct=round(support_share * 100, 2),
+            market_job_count=market.job_count,
+            market_salary_annual_median=market.median_salary_annual,
+            market_momentum=market.momentum,
+            salary_lift_pct=salary_lift_pct,
+        )
+        confidence = ScenarioConfidence(
+            score=_bounded_score(
+                0.35 + (support_share * 0.35)
+                + (_positive_ratio(salary_lift_pct, 0.25) * 0.15)
+                + (_positive_ratio(market.momentum, 0.2) * 0.15)
+            ),
+            evidence_coverage=round(support_share, 4),
+            market_sample_size=market.job_count,
+            reasons=(
+                f"{supporting_jobs} reachable jobs mention {display_skill}.",
+                _format_market_reason(market, salary_lift_pct),
+            ),
+        )
+        market_position = _market_position_from_signal(
+            support_share=support_share,
+            momentum=market.momentum,
+            salary_lift_pct=salary_lift_pct,
+        )
+        scenario = ScenarioSummary(
+            scenario_id=build_scenario_id(
+                ScenarioType.SKILL_ADDITION,
+                target_title_family=skill_key,
+                market_position=market_position,
+            ),
+            scenario_type=ScenarioType.SKILL_ADDITION,
+            title=f"Add {display_skill}",
+            summary=(
+                f"{display_skill} appears repeatedly in reachable jobs and can improve access "
+                "without a large role change."
+            ),
+            market_position=market_position,
+            confidence=confidence,
+            change=ScenarioChange(added_skills=(display_skill,)),
+            signals=(signal,),
+            thin_market=baseline.thin_market,
+            degraded=baseline.degraded,
+            expected_salary_delta_pct=salary_lift_pct,
+        )
+        score = confidence.score + (salary_lift_pct or 0.0) + (market.momentum or 0.0)
+        scored.append((score, scenario))
+
+    scored.sort(key=lambda item: (item[0], item[1].title), reverse=True)
+    return [summary for _, summary in scored[:MAX_SKILL_ADDITION_SCENARIOS]]
+
+
+def _generate_skill_substitution_scenarios(
+    *,
+    current_skills: dict[str, str],
+    analysis_set: list[CareerDeltaCandidate],
+    baseline: BaselineMarketPosition,
+    market_stats: MarketStatsProvider,
+    search_scoring: SearchScoringProvider,
+) -> list[ScenarioSummary]:
+    if not current_skills:
+        return []
+
+    skill_presence: Counter[str] = Counter()
+    display_names: dict[str, str] = {}
+    for candidate in analysis_set:
+        for skill in candidate.skills:
+            key = skill.strip().lower()
+            if not key:
+                continue
+            skill_presence[key] += 1
+            display_names.setdefault(key, skill)
+
+    scored: list[tuple[float, ScenarioSummary]] = []
+    for source_key, source_skill in sorted(current_skills.items()):
+        related_payload = search_scoring.get_related_skills(source_skill, k=RELATED_SKILL_LIMIT) or ()
+        source_market = market_stats.get_skill_stats(source_skill)
+        for related in related_payload:
+            target_skill = str(related.get("skill", "")).strip()
+            if not target_skill:
+                continue
+            target_key = target_skill.lower()
+            if target_key in current_skills:
+                continue
+
+            similarity = float(related.get("similarity", 0.0) or 0.0)
+            same_cluster = bool(related.get("same_cluster", False))
+            if not same_cluster and similarity < MIN_SUBSTITUTION_SIMILARITY:
+                continue
+
+            target_market = market_stats.get_skill_stats(target_skill)
+            if source_market.job_count <= 0 or target_market.job_count <= 0:
+                continue
+
+            job_count_ratio = target_market.job_count / max(source_market.job_count, 1)
+            momentum_delta = (target_market.momentum or 0.0) - (source_market.momentum or 0.0)
+            salary_lift_pct = _salary_lift_pct(
+                target_market.median_salary_annual,
+                baseline.salary_band.median_annual,
+            )
+            target_supporting_jobs = skill_presence.get(target_key, 0)
+            supporting_share = target_supporting_jobs / len(analysis_set)
+            if target_supporting_jobs < MIN_SKILL_SUPPORTING_JOBS:
+                continue
+            if job_count_ratio < MIN_SUBSTITUTION_JOB_COUNT_RATIO:
+                continue
+            if (
+                momentum_delta < MIN_SUBSTITUTION_MOMENTUM_DELTA
+                and (salary_lift_pct or 0.0) < MIN_SUBSTITUTION_SALARY_LIFT_PCT
+            ):
+                continue
+
+            signal = SkillScenarioSignal(
+                skill=target_skill,
+                supporting_jobs=target_supporting_jobs,
+                supporting_share_pct=round(supporting_share * 100, 2),
+                market_job_count=target_market.job_count,
+                market_salary_annual_median=target_market.median_salary_annual,
+                market_momentum=target_market.momentum,
+                salary_lift_pct=salary_lift_pct,
+                similarity=similarity,
+                same_cluster=same_cluster,
+            )
+            confidence = ScenarioConfidence(
+                score=_bounded_score(
+                    0.4
+                    + (_positive_ratio(similarity, 1.0) * 0.2)
+                    + (_positive_ratio(job_count_ratio - 1.0, 0.8) * 0.15)
+                    + (_positive_ratio(momentum_delta, 0.2) * 0.15)
+                    + (_positive_ratio(supporting_share, 0.5) * 0.1)
+                ),
+                evidence_coverage=round(supporting_share, 4),
+                market_sample_size=target_market.job_count,
+                reasons=(
+                    f"{target_skill} is adjacent to {source_skill}.",
+                    (
+                        f"{target_skill} shows stronger demand than {source_skill} "
+                        f"({target_market.job_count} vs {source_market.job_count} jobs)."
+                    ),
+                ),
+            )
+            market_position = _market_position_from_signal(
+                support_share=supporting_share,
+                momentum=target_market.momentum,
+                salary_lift_pct=salary_lift_pct,
+            )
+            scenario = ScenarioSummary(
+                scenario_id=build_scenario_id(
+                    ScenarioType.SKILL_SUBSTITUTION,
+                    source_title_family=source_key,
+                    target_title_family=target_key,
+                    market_position=market_position,
+                ),
+                scenario_type=ScenarioType.SKILL_SUBSTITUTION,
+                title=f"Shift {source_skill} toward {target_skill}",
+                summary=(
+                    f"{target_skill} is a close neighbor to {source_skill} with better current "
+                    "market support in the reachable pool."
+                ),
+                market_position=market_position,
+                confidence=confidence,
+                change=ScenarioChange(
+                    added_skills=(target_skill,),
+                    removed_skills=(source_skill,),
+                    replaced_skills=(SkillReplacement(from_skill=source_skill, to_skill=target_skill),),
+                ),
+                signals=(signal,),
+                thin_market=baseline.thin_market,
+                degraded=baseline.degraded,
+                expected_salary_delta_pct=salary_lift_pct,
+            )
+            score = confidence.score + (salary_lift_pct or 0.0) + momentum_delta
+            scored.append((score, scenario))
+
+    deduped = _dedupe_substitution_summaries(scored)
+    deduped.sort(key=lambda item: (item[0], item[1].title), reverse=True)
+    return [summary for _, summary in deduped[:MAX_SKILL_SUBSTITUTION_SCENARIOS]]
+
+
+def _analysis_candidates(candidate_pool: CareerDeltaCandidatePool) -> list[CareerDeltaCandidate]:
+    reachable = [
+        candidate for candidate in candidate_pool.candidates if candidate.overall_fit >= REACHABLE_FIT_THRESHOLD
+    ]
+    return reachable or list(candidate_pool.candidates[:20])
+
+
+def _normalize_skill_inventory(skills: tuple[str, ...]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for skill in skills:
+        cleaned = skill.strip()
+        if cleaned:
+            normalized.setdefault(cleaned.lower(), cleaned)
+    return normalized
+
+
+def _salary_lift_pct(
+    target_salary_annual: Optional[int],
+    baseline_salary_annual: Optional[int],
+) -> Optional[float]:
+    if not target_salary_annual or not baseline_salary_annual or baseline_salary_annual <= 0:
+        return None
+    return round((target_salary_annual - baseline_salary_annual) / baseline_salary_annual, 4)
+
+
+def _positive_ratio(value: Optional[float], cap: float) -> float:
+    if value is None or value <= 0 or cap <= 0:
+        return 0.0
+    return min(value / cap, 1.0)
+
+
+def _bounded_score(value: float) -> float:
+    return round(max(0.0, min(value, 0.99)), 4)
+
+
+def _format_market_reason(market, salary_lift_pct: Optional[float]) -> str:
+    details = [f"{market.job_count} recent postings"]
+    if market.momentum is not None:
+        details.append(f"momentum {market.momentum:+.2f}")
+    if salary_lift_pct is not None:
+        details.append(f"salary delta {salary_lift_pct:+.0%}")
+    return ", ".join(details)
+
+
+def _market_position_from_signal(
+    *,
+    support_share: float,
+    momentum: Optional[float],
+    salary_lift_pct: Optional[float],
+) -> MarketPosition:
+    if support_share >= 0.35 and (momentum or 0.0) >= 0.08:
+        return MarketPosition.COMPETITIVE
+    if support_share >= 0.2 or (salary_lift_pct or 0.0) >= 0.1:
+        return MarketPosition.STRETCH
+    return MarketPosition.UNCLEAR
+
+
+def _dedupe_substitution_summaries(
+    scored: list[tuple[float, ScenarioSummary]],
+) -> list[tuple[float, ScenarioSummary]]:
+    best_by_target: dict[str, tuple[float, ScenarioSummary]] = {}
+    for item in scored:
+        score, summary = item
+        target = summary.change.added_skills[0].lower() if summary.change and summary.change.added_skills else ""
+        current = best_by_target.get(target)
+        if current is None or (score, summary.title) > (current[0], current[1].title):
+            best_by_target[target] = item
+    return list(best_by_target.values())

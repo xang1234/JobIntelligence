@@ -74,6 +74,7 @@ class SearchEngineCareerDeltaProvider:
             job_skills = tuple(self.engine._parse_skills(job.get("skills")))
             matched_skills = tuple(sorted(set(extracted_skills).intersection(job_skills)))
             missing_skills = tuple(sorted(set(extracted_skills) - set(job_skills)))[:10]
+            gap_skills = tuple(sorted(set(job_skills) - set(extracted_skills)))[:10]
             skill_overlap = len(matched_skills) / len(extracted_skills) if extracted_skills else 0.0
 
             semantic_score = (
@@ -126,6 +127,7 @@ class SearchEngineCareerDeltaProvider:
                     salary_fit=round(float(salary_fit), 4) if salary_fit is not None else None,
                     matched_skills=matched_skills,
                     missing_skills=missing_skills,
+                    gap_skills=gap_skills,
                     skills=job_skills,
                     categories=tuple(self._split_csv(job.get("categories"))),
                     salary_annual_min=job.get("salary_annual_min"),
@@ -148,6 +150,19 @@ class SearchEngineCareerDeltaProvider:
             degraded=self.engine._degraded,
         )
 
+    def get_related_skills(self, skill: str, k: int = 10):
+        """Return related-skill metadata with a case-insensitive lookup fallback."""
+        related = self.engine.get_related_skills(skill, k=k)
+        if related is not None:
+            return tuple(related.get("related", ()))
+
+        normalized = self._canonical_skill(skill)
+        if normalized != skill:
+            related = self.engine.get_related_skills(normalized, k=k)
+            if related is not None:
+                return tuple(related.get("related", ()))
+        return ()
+
     @staticmethod
     def _split_csv(raw_value) -> list[str]:
         if not raw_value:
@@ -165,3 +180,13 @@ class SearchEngineCareerDeltaProvider:
             if not direct.is_unknown:
                 by_company[company_name].append(direct)
         return by_company
+
+    def _canonical_skill(self, skill: str) -> str:
+        query_expander = getattr(self.engine, "query_expander", None)
+        if query_expander and hasattr(query_expander, "_skill_lower_map"):
+            return query_expander._skill_lower_map.get(skill.lower(), skill)
+        skill_to_idx = getattr(self.engine.index_manager, "skill_to_idx", {})
+        for known_skill in skill_to_idx.keys():
+            if known_skill.lower() == skill.lower():
+                return known_skill
+        return skill

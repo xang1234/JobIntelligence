@@ -123,6 +123,34 @@ def test_provider_keeps_pool_broad_even_with_target_titles(temp_dir, empty_db):
     assert titles["Analytics Engineer"] is False
 
 
+def test_provider_records_job_side_gap_skills_for_addition_scenarios(temp_dir, empty_db):
+    _insert_job(
+        empty_db,
+        title="Platform Engineer",
+        company_name="Infra Labs",
+        skills=["Python", "SQL", "Kubernetes"],
+        categories=["Information Technology"],
+        posted_days_ago=1,
+        salary_min=12000,
+        salary_max=15000,
+    )
+
+    engine = SemanticSearchEngine(
+        db_path=str(empty_db.db_path),
+        index_dir=temp_dir / "missing-indexes",
+    )
+    provider = SearchEngineCareerDeltaProvider(engine, minimum_pool_size=10)
+
+    pool = provider.build_candidate_pool(
+        CareerDeltaRequest(
+            profile_text="Data engineer with Python and SQL experience.",
+            limit=5,
+        )
+    )
+
+    assert pool.candidates[0].gap_skills == ("Kubernetes",)
+
+
 def test_engine_produces_baseline_from_candidate_pool(temp_dir, empty_db):
     for idx in range(6):
         _insert_job(
