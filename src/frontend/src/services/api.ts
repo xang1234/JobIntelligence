@@ -1,5 +1,7 @@
 import axios from 'axios'
 import type {
+  CareerDeltaAnalysisRequest,
+  CareerDeltaAnalysisResponse,
   CompanySimilarity,
   CompanySimilarityRequest,
   CompanyTrendResponse,
@@ -117,6 +119,11 @@ export async function getRoleTrend(req: RoleTrendRequest): Promise<RoleTrendResp
 
 export async function matchProfile(req: ProfileMatchRequest): Promise<ProfileMatchResponse> {
   const { data } = await client.post<ProfileMatchResponse>('/api/match/profile', req)
+  return data
+}
+
+export async function analyzeCareerDelta(req: CareerDeltaAnalysisRequest): Promise<CareerDeltaAnalysisResponse> {
+  const { data } = await client.post<CareerDeltaAnalysisResponse>('/api/career-delta', req)
   return data
 }
 

@@ -74,6 +74,57 @@ export interface ProfileMatchRequest {
   limit?: number
 }
 
+export type CareerDeltaScenarioType =
+  | 'same_role'
+  | 'adjacent_role'
+  | 'industry_pivot'
+  | 'title_pivot'
+  | 'same_role_industry_pivot'
+  | 'adjacent_role_industry_pivot'
+  | 'skill_addition'
+  | 'skill_substitution'
+
+export type CareerDeltaMarketPosition =
+  | 'leading'
+  | 'competitive'
+  | 'stretch'
+  | 'thin'
+  | 'unclear'
+
+export interface CareerDeltaAnalysisRequest {
+  profile_text: string
+  current_title?: string | null
+  target_titles?: string[]
+  current_categories?: string[]
+  current_skills?: string[]
+  current_company?: string | null
+  location?: string | null
+  target_salary_min?: number | null
+  max_scenarios?: number
+  include_filtered?: boolean
+  delta_types?: CareerDeltaScenarioType[]
+}
+
+export interface MatchLabSharedInputs {
+  profileText: string
+  targetTitles: string
+  salaryExpectation: string
+  employmentType: string
+  region: string
+}
+
+export interface MatchLabCareerDeltaOptions {
+  currentTitle?: string | null
+  currentCategories?: string[]
+  currentSkills?: string[]
+  currentCompany?: string | null
+  location?: string | null
+  targetSalaryMin?: number | null
+  maxScenarios?: number
+  includeFiltered?: boolean
+  deltaTypes?: CareerDeltaScenarioType[]
+}
+
 // =============================================================================
 // Response Types
 // =============================================================================
@@ -260,6 +311,121 @@ export interface ProfileMatchResponse {
   total_candidates: number
   search_time_ms: number
   degraded: boolean
+}
+
+export interface CareerDeltaConfidence {
+  score: number
+  evidence_coverage: number
+  market_sample_size: number
+  reasons: string[]
+}
+
+export interface CareerDeltaScoreBreakdown {
+  opportunity: number
+  quality: number
+  salary: number
+  momentum: number
+  diversity: number
+  raw_score: number
+  pivot_cost: number
+  final_score: number
+}
+
+export interface CareerDeltaMarketInsight {
+  name: string
+  job_count: number
+  share_pct: number
+}
+
+export interface CareerDeltaSalaryBand {
+  min_annual: number | null
+  median_annual: number | null
+  max_annual: number | null
+}
+
+export interface CareerDeltaSkillReplacement {
+  from_skill: string
+  to_skill: string
+}
+
+export interface CareerDeltaScenarioChange {
+  added_skills: string[]
+  removed_skills: string[]
+  replaced_skills: CareerDeltaSkillReplacement[]
+  source_title_family: string | null
+  target_title_family: string | null
+  source_industry: string | null
+  target_industry: string | null
+}
+
+export interface CareerDeltaScenarioSignal {
+  signal_type: 'skill' | 'pivot'
+  skill: string | null
+  supporting_jobs: number
+  supporting_share_pct: number
+  market_job_count: number
+  market_salary_annual_median: number | null
+  market_momentum: number | null
+  salary_lift_pct: number | null
+  similarity: number | null
+  same_cluster: boolean | null
+  target_title_family: string | null
+  target_industry: string | null
+  title_distance: string | null
+  industry_distance: number | null
+  fit_median: number | null
+}
+
+export interface CareerDeltaBaseline {
+  position: CareerDeltaMarketPosition
+  reachable_jobs: number
+  total_candidates: number
+  fit_median: number
+  fit_p90: number
+  salary_band: CareerDeltaSalaryBand
+  top_industries: CareerDeltaMarketInsight[]
+  top_companies: CareerDeltaMarketInsight[]
+  extracted_skills: string[]
+  skill_coverage: number
+  top_skill_gaps: CareerDeltaMarketInsight[]
+  notes: string[]
+  thin_market: boolean
+  degraded: boolean
+}
+
+export interface CareerDeltaScenarioSummary {
+  scenario_id: string
+  scenario_type: CareerDeltaScenarioType
+  title: string
+  summary: string
+  market_position: CareerDeltaMarketPosition
+  confidence: CareerDeltaConfidence
+  score_breakdown: CareerDeltaScoreBreakdown | null
+  change: CareerDeltaScenarioChange | null
+  signals: CareerDeltaScenarioSignal[]
+  target_title: string | null
+  target_sector: string | null
+  thin_market: boolean
+  degraded: boolean
+  expected_salary_delta_pct: number | null
+}
+
+export interface CareerDeltaFilteredScenario {
+  scenario_id: string
+  scenario_type: CareerDeltaScenarioType
+  reason_code: string
+  explanation: string
+  confidence: CareerDeltaConfidence
+  market_position: CareerDeltaMarketPosition
+}
+
+export interface CareerDeltaAnalysisResponse {
+  baseline: CareerDeltaBaseline | null
+  scenarios: CareerDeltaScenarioSummary[]
+  filtered_scenarios: CareerDeltaFilteredScenario[]
+  degraded: boolean
+  thin_market: boolean
+  analysis_time_ms: number | null
 }
 
 // =============================================================================

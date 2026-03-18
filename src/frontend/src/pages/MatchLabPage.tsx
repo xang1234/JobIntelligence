@@ -1,31 +1,22 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import JobCard from '@/components/JobCard'
 import { matchProfile } from '@/services/api'
+import { buildProfileMatchRequest } from '@/services/matchLab'
+import type { MatchLabSharedInputs } from '@/types/api'
 
 export default function MatchLabPage() {
-  const [profileText, setProfileText] = useState(
-    'Senior data professional with Python, SQL, machine learning, experimentation, stakeholder management, and dashboarding experience. Looking for Singapore-based roles in AI, analytics, or applied ML.',
-  )
-  const [targetTitles, setTargetTitles] = useState('Data Scientist, Machine Learning Engineer')
-  const [salaryExpectation, setSalaryExpectation] = useState('180000')
-  const [employmentType, setEmploymentType] = useState('')
-  const [region, setRegion] = useState('')
-
-  const titles = useMemo(
-    () => targetTitles.split(',').map((item) => item.trim()).filter(Boolean),
-    [targetTitles],
-  )
+  const [inputs, setInputs] = useState<MatchLabSharedInputs>({
+    profileText:
+      'Senior data professional with Python, SQL, machine learning, experimentation, stakeholder management, and dashboarding experience. Looking for Singapore-based roles in AI, analytics, or applied ML.',
+    targetTitles: 'Data Scientist, Machine Learning Engineer',
+    salaryExpectation: '180000',
+    employmentType: '',
+    region: '',
+  })
 
   const mutation = useMutation({
-    mutationFn: () => matchProfile({
-      profile_text: profileText,
-      target_titles: titles,
-      salary_expectation_annual: salaryExpectation ? Number(salaryExpectation) : null,
-      employment_type: employmentType || null,
-      region: region || null,
-      limit: 12,
-    }),
+    mutationFn: () => matchProfile(buildProfileMatchRequest(inputs)),
   })
 
   return (
@@ -46,8 +37,8 @@ export default function MatchLabPage() {
           <label className="block text-sm font-semibold text-[color:var(--ink)]">
             Candidate profile or resume text
             <textarea
-              value={profileText}
-              onChange={(event) => setProfileText(event.target.value)}
+              value={inputs.profileText}
+              onChange={(event) => setInputs((current) => ({ ...current, profileText: event.target.value }))}
               rows={12}
               className="mt-3 block w-full rounded-[24px] border border-[color:var(--border)] bg-[color:var(--surface)] px-4 py-4 text-sm leading-6 text-slate-700"
             />
@@ -57,8 +48,8 @@ export default function MatchLabPage() {
             <label className="text-sm text-slate-600">
               Target titles
               <input
-                value={targetTitles}
-                onChange={(event) => setTargetTitles(event.target.value)}
+                value={inputs.targetTitles}
+                onChange={(event) => setInputs((current) => ({ ...current, targetTitles: event.target.value }))}
                 placeholder="Data Scientist, ML Engineer"
                 className="mt-1 block w-full rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] px-4 py-3"
               />
@@ -66,8 +57,10 @@ export default function MatchLabPage() {
             <label className="text-sm text-slate-600">
               Salary expectation (annual)
               <input
-                value={salaryExpectation}
-                onChange={(event) => setSalaryExpectation(event.target.value)}
+                value={inputs.salaryExpectation}
+                onChange={(event) =>
+                  setInputs((current) => ({ ...current, salaryExpectation: event.target.value }))
+                }
                 type="number"
                 min={0}
                 className="mt-1 block w-full rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] px-4 py-3"
@@ -76,8 +69,8 @@ export default function MatchLabPage() {
             <label className="text-sm text-slate-600">
               Employment type
               <input
-                value={employmentType}
-                onChange={(event) => setEmploymentType(event.target.value)}
+                value={inputs.employmentType}
+                onChange={(event) => setInputs((current) => ({ ...current, employmentType: event.target.value }))}
                 placeholder="Full Time"
                 className="mt-1 block w-full rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] px-4 py-3"
               />
@@ -85,8 +78,8 @@ export default function MatchLabPage() {
             <label className="text-sm text-slate-600">
               Region
               <input
-                value={region}
-                onChange={(event) => setRegion(event.target.value)}
+                value={inputs.region}
+                onChange={(event) => setInputs((current) => ({ ...current, region: event.target.value }))}
                 placeholder="Central"
                 className="mt-1 block w-full rounded-2xl border border-[color:var(--border)] bg-[color:var(--surface)] px-4 py-3"
               />
@@ -96,7 +89,7 @@ export default function MatchLabPage() {
           <button
             type="button"
             onClick={() => mutation.mutate()}
-            disabled={mutation.isPending || profileText.trim().length < 20}
+            disabled={mutation.isPending || inputs.profileText.trim().length < 20}
             className="mt-6 rounded-full bg-[color:var(--brand)] px-5 py-3 text-sm font-semibold text-white shadow-lg transition hover:bg-[color:var(--brand-strong)] disabled:cursor-not-allowed disabled:opacity-50"
           >
             {mutation.isPending ? 'Scoring profile...' : 'Run profile match'}
