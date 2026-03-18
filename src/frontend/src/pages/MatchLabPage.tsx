@@ -85,23 +85,6 @@ function areSharedInputsEqual(left: MatchLabSharedInputs, right: MatchLabSharedI
   )
 }
 
-function stripAppliedScenarioSection(profileText: string): string {
-  const marker = '\n\nApplied What If adjustments:\n'
-  const markerIndex = profileText.indexOf(marker)
-  if (markerIndex === -1) {
-    return profileText.trim()
-  }
-  return profileText.slice(0, markerIndex).trim()
-}
-
-function buildAppliedProfileText(profileText: string, changes: string[]): string {
-  const baseProfile = stripAppliedScenarioSection(profileText)
-  if (!changes.length) {
-    return baseProfile
-  }
-  return `${baseProfile}\n\nApplied What If adjustments:\n- ${changes.join('\n- ')}`
-}
-
 function describeScenarioChange(change: CareerDeltaScenarioChange | null): string[] {
   if (!change) {
     return []
@@ -189,7 +172,6 @@ function buildAppliedScenarioState(
 
   const nextInputs: MatchLabSharedInputs = {
     ...currentInputs,
-    profileText: buildAppliedProfileText(currentInputs.profileText, changes),
     targetTitles: detail.target_title ?? currentInputs.targetTitles,
   }
 
@@ -1036,6 +1018,7 @@ export default function MatchLabPage() {
     }
     setInputs(appliedScenario.previousInputs)
     setAppliedScenario(null)
+    runCurrentMatch(appliedScenario.previousInputs)
   }
 
   return (
