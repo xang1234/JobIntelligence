@@ -570,7 +570,7 @@ class TestCareerDeltaEndpoint:
     def test_career_delta_analysis(self, client, mock_engine):
         mock_engine._career_delta_engine = MagicMock()
         mock_engine._career_delta_engine.analyze.return_value = CareerDeltaResponse(
-            request=None,
+            request=MagicMock(location="Singapore"),
             baseline=BaselineMarketPosition(
                 position=MarketPosition.COMPETITIVE,
                 reachable_jobs=12,
@@ -622,10 +622,81 @@ class TestCareerDeltaEndpoint:
         assert internal_req.profile_text == "Senior data analyst with Python, SQL, and dashboarding experience."
         assert internal_req.limit == 6
 
+    def test_career_delta_detail_returns_cached_detail(self, client, mock_engine):
+        mock_engine._career_delta_engine = MagicMock()
+        mock_engine._career_delta_engine.analyze.return_value = CareerDeltaResponse(
+            request=MagicMock(location="Singapore"),
+            summaries=(
+                ScenarioSummary(
+                    scenario_id="skill_addition:abc",
+                    scenario_type=ScenarioType.SKILL_ADDITION,
+                    title="Add Kubernetes",
+                    summary="Add Kubernetes to access more platform roles.",
+                    market_position=MarketPosition.COMPETITIVE,
+                    confidence=ScenarioConfidence(score=0.82, evidence_coverage=0.6, market_sample_size=20),
+                ),
+            ),
+        )
+
+        post_resp = client.post(
+            "/api/career-delta",
+            json={"profile_text": "Senior data analyst with Python, SQL, and dashboarding experience."},
+        )
+        assert post_resp.status_code == 200
+
+        detail_resp = client.get("/api/career-delta/skill_addition:abc/detail")
+        assert detail_resp.status_code == 200
+        data = detail_resp.json()
+        assert data["scenario_id"] == "skill_addition:abc"
+        assert data["title"] == "Add Kubernetes"
+        assert data["summary"]["scenario_id"] == "skill_addition:abc"
+        assert data["evidence"][0] == "Add Kubernetes to access more platform roles."
+
+    def test_career_delta_detail_404_when_unknown(self, client):
+        resp = client.get("/api/career-delta/missing-scenario/detail")
+        assert resp.status_code == 404
+        assert resp.json()["error"]["code"] == "NOT_FOUND"
+
+    def test_career_delta_detail_404_after_expiry(self, mock_engine):
+        import sys
+
+        app_module = sys.modules["src.api.app"]
+
+        mock_engine._career_delta_engine = MagicMock()
+        mock_engine._career_delta_engine.analyze.return_value = CareerDeltaResponse(
+            request=MagicMock(location=None),
+            summaries=(
+                ScenarioSummary(
+                    scenario_id="title_pivot:abc",
+                    scenario_type=ScenarioType.TITLE_PIVOT,
+                    title="Pivot toward Platform Engineer",
+                    summary="Move into platform engineering.",
+                    market_position=MarketPosition.STRETCH,
+                    confidence=ScenarioConfidence(score=0.7, evidence_coverage=0.5, market_sample_size=16),
+                ),
+            ),
+        )
+        app = _create_test_app(mock_engine)
+        app.state.career_delta_detail_ttl_seconds = 0
+        app_module._search_engine = mock_engine
+        try:
+            test_client = TestClient(app, raise_server_exceptions=False)
+            post_resp = test_client.post(
+                "/api/career-delta",
+                json={"profile_text": "Senior data analyst with Python, SQL, and dashboarding experience."},
+            )
+            assert post_resp.status_code == 200
+
+            detail_resp = test_client.get("/api/career-delta/title_pivot:abc/detail")
+            assert detail_resp.status_code == 404
+            assert detail_resp.json()["error"]["message"] == "Unknown or expired scenario_id: title_pivot:abc"
+        finally:
+            app_module._search_engine = None
+
     def test_career_delta_analysis_filters_requested_types(self, client, mock_engine):
         mock_engine._career_delta_engine = MagicMock()
         mock_engine._career_delta_engine.analyze.return_value = CareerDeltaResponse(
-            request=None,
+            request=MagicMock(location="Singapore"),
             summaries=(
                 ScenarioSummary(
                     scenario_id="skill_addition:abc",

@@ -21,11 +21,22 @@ from functools import partial
 from pathlib import Path
 from typing import Optional
 
+from cachetools import TTLCache
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from ..mcf.career_delta import CareerDeltaDependencies, CareerDeltaEngine
+from ..mcf.career_delta import (
+    CareerDeltaCandidate,
+    CareerDeltaCandidatePool,
+    CareerDeltaDependencies,
+    CareerDeltaEngine,
+    CareerDeltaResponse,
+    PivotScenarioSignal,
+    ScenarioDetail,
+    ScenarioSummary,
+    SkillScenarioSignal,
+)
 from ..mcf.career_delta_retrieval import SearchEngineCareerDeltaProvider
 from ..mcf.embeddings import SemanticSearchEngine
 from ..mcf.embeddings.models import SimilarJobsRequest as InternalSimilarJobsRequest
@@ -35,6 +46,7 @@ from .middleware import RateLimitMiddleware, RequestLoggingMiddleware
 from .models import (
     CareerDeltaAnalysisRequest,
     CareerDeltaAnalysisResponse,
+    CareerDeltaScenarioDetail,
     CompanySimilarity,
     CompanySimilarityRequest,
     CompanyTrendResponse,
@@ -103,6 +115,209 @@ def _get_career_delta_engine(engine: SemanticSearchEngine) -> CareerDeltaEngine:
     )
     setattr(engine, "_career_delta_engine", career_engine)
     return career_engine
+
+
+def _get_career_delta_detail_cache(
+    engine: SemanticSearchEngine,
+    *,
+    ttl_seconds: int,
+    max_entries: int,
+) -> TTLCache:
+    """Lazily construct the short-lived scenario detail cache."""
+    cached = getattr(engine, "_career_delta_detail_cache", None)
+    if isinstance(cached, TTLCache):
+        return cached
+
+    cache = TTLCache(maxsize=max_entries, ttl=ttl_seconds)
+    setattr(engine, "_career_delta_detail_cache", cache)
+    return cache
+
+
+def _filter_detail_summaries(
+    response: CareerDeltaResponse,
+    allowed_delta_types: tuple[str, ...],
+) -> list[ScenarioSummary]:
+    if not allowed_delta_types:
+        return list(response.summaries)
+    allowed = set(allowed_delta_types)
+    return [summary for summary in response.summaries if summary.scenario_type.value in allowed]
+
+
+def _supporting_candidates(
+    summary: ScenarioSummary,
+    candidate_pool: Optional[CareerDeltaCandidatePool],
+) -> list[CareerDeltaCandidate]:
+    if candidate_pool is None:
+        return []
+
+    candidates = list(candidate_pool.candidates)
+    change = summary.change
+    if change is not None:
+        if change.target_title_family:
+            narrowed = [candidate for candidate in candidates if candidate.title_family == change.target_title_family]
+            if narrowed:
+                candidates = narrowed
+        target_industry = change.target_industry or summary.target_sector
+        if target_industry:
+            narrowed = [candidate for candidate in candidates if candidate.industry_key == target_industry]
+            if narrowed:
+                candidates = narrowed
+        added_skills = set(change.added_skills)
+        replacement_skills = {item.to_skill for item in change.replaced_skills}
+        if added_skills:
+            narrowed = [
+                candidate
+                for candidate in candidates
+                if added_skills.intersection(candidate.gap_skills) or added_skills.intersection(candidate.skills)
+            ]
+            if narrowed:
+                candidates = narrowed
+        if replacement_skills:
+            narrowed = [candidate for candidate in candidates if replacement_skills.intersection(candidate.skills)]
+            if narrowed:
+                candidates = narrowed
+
+    return sorted(candidates, key=lambda candidate: candidate.overall_fit, reverse=True)[:5]
+
+
+def _detail_narrative(summary: ScenarioSummary) -> str:
+    change = summary.change
+    if change and change.added_skills:
+        skills = ", ".join(change.added_skills)
+        return f"{summary.summary} Focus on building evidence in {skills} before reassessing the target lane."
+    if change and change.replaced_skills:
+        swaps = ", ".join(f"{item.from_skill} -> {item.to_skill}" for item in change.replaced_skills)
+        return f"{summary.summary} The main substitution to test is {swaps}."
+    if summary.target_title or (change and change.target_title_family):
+        target = summary.target_title or change.target_title_family
+        return f"{summary.summary} Use this scenario as a probe for {target} roles rather than an all-at-once rewrite."
+    return f"{summary.summary} Review the supporting evidence before treating it as an action plan."
+
+
+def _detail_evidence(summary: ScenarioSummary, candidates: list[CareerDeltaCandidate]) -> tuple[str, ...]:
+    evidence: list[str] = [summary.summary]
+    for signal in summary.signals:
+        if isinstance(signal, SkillScenarioSignal):
+            evidence.append(
+                f"{signal.supporting_jobs} reachable jobs mention {signal.skill} "
+                f"({signal.supporting_share_pct:.1f}% of the reachable pool)."
+            )
+        elif isinstance(signal, PivotScenarioSignal):
+            evidence.append(
+                f"{signal.supporting_jobs} reachable jobs support {signal.target_title_family} "
+                f"in {signal.target_industry} ({signal.supporting_share_pct:.1f}% share)."
+            )
+    if candidates:
+        examples = "; ".join(f"{candidate.title} at {candidate.company_name}" for candidate in candidates[:3])
+        evidence.append(f"Representative jobs: {examples}.")
+    return tuple(evidence[:5])
+
+
+def _detail_missing_skills(summary: ScenarioSummary, candidates: list[CareerDeltaCandidate]) -> tuple[str, ...]:
+    change = summary.change
+    if change is None:
+        return ()
+
+    missing: list[str] = list(change.added_skills)
+    missing.extend(item.to_skill for item in change.replaced_skills)
+    if candidates:
+        pool_missing = sorted({skill for candidate in candidates for skill in candidate.missing_skills})
+        missing.extend(pool_missing[:5])
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for skill in missing:
+        key = skill.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(skill)
+    return tuple(deduped[:8])
+
+
+def _detail_search_queries(summary: ScenarioSummary, response: CareerDeltaResponse) -> tuple[str, ...]:
+    change = summary.change
+    queries: list[str] = []
+    location = response.request.location
+    if summary.target_title:
+        queries.append(summary.target_title)
+    elif change and change.target_title_family:
+        queries.append(change.target_title_family.replace("-", " "))
+    for skill in change.added_skills if change else ():
+        queries.append(skill)
+    for replacement in change.replaced_skills if change else ():
+        queries.append(replacement.to_skill)
+    if location and queries:
+        queries = [f"{query} {location}" for query in queries]
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        normalized = " ".join(query.split())
+        key = normalized.lower()
+        if not normalized or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+    return tuple(deduped[:6])
+
+
+def _build_scenario_detail(summary: ScenarioSummary, response: CareerDeltaResponse) -> ScenarioDetail:
+    candidates = _supporting_candidates(summary, response.candidate_pool)
+    return ScenarioDetail(
+        scenario_id=summary.scenario_id,
+        scenario_type=summary.scenario_type,
+        title=summary.title,
+        narrative=_detail_narrative(summary),
+        market_position=summary.market_position,
+        confidence=summary.confidence,
+        score_breakdown=summary.score_breakdown,
+        summary=summary,
+        change=summary.change,
+        signals=summary.signals,
+        target_title=summary.target_title,
+        target_sector=summary.target_sector,
+        evidence=_detail_evidence(summary, candidates),
+        missing_skills=_detail_missing_skills(summary, candidates),
+        search_queries=_detail_search_queries(summary, response),
+        thin_market=summary.thin_market,
+        degraded=summary.degraded,
+    )
+
+
+def _execute_career_delta_analysis(
+    engine: SemanticSearchEngine,
+    internal_req,
+    *,
+    allowed_delta_types: tuple[str, ...],
+    detail_cache_ttl_seconds: int,
+    detail_cache_max_entries: int,
+) -> CareerDeltaResponse:
+    executor = _get_career_delta_engine(engine)
+    response = executor.analyze(internal_req)
+    cache = _get_career_delta_detail_cache(
+        engine,
+        ttl_seconds=detail_cache_ttl_seconds,
+        max_entries=detail_cache_max_entries,
+    )
+    for summary in _filter_detail_summaries(response, allowed_delta_types):
+        cache[summary.scenario_id] = _build_scenario_detail(summary, response)
+    return response
+
+
+def _lookup_cached_scenario_detail(
+    engine: SemanticSearchEngine,
+    scenario_id: str,
+    *,
+    detail_cache_ttl_seconds: int,
+    detail_cache_max_entries: int,
+) -> Optional[ScenarioDetail]:
+    cache = _get_career_delta_detail_cache(
+        engine,
+        ttl_seconds=detail_cache_ttl_seconds,
+        max_entries=detail_cache_max_entries,
+    )
+    return cache.get(scenario_id)
 
 
 @asynccontextmanager
@@ -198,6 +413,8 @@ def create_app(
     app.state.db_path = db_path
     app.state.index_dir = index_dir
     app.state.rate_limit_rpm = rate_limit_rpm
+    app.state.career_delta_detail_ttl_seconds = 300
+    app.state.career_delta_detail_cache_max_entries = 256
 
     if cors_origins is None:
         cors_origins = ["http://localhost:3000", "http://localhost:5173"]
@@ -506,10 +723,20 @@ def _register_routes(app: FastAPI) -> None:
         """Run career-delta analysis through the serialized backend executor."""
         loop = asyncio.get_running_loop()
         internal_req = request.to_internal()
-        executor = _get_career_delta_engine(engine)
+        allowed_delta_types = tuple(item.value for item in request.selected_delta_types())
         started = loop.time()
         try:
-            internal_resp = await loop.run_in_executor(_engine_executor, executor.analyze, internal_req)
+            internal_resp = await loop.run_in_executor(
+                _engine_executor,
+                partial(
+                    _execute_career_delta_analysis,
+                    engine,
+                    internal_req,
+                    allowed_delta_types=allowed_delta_types,
+                    detail_cache_ttl_seconds=app.state.career_delta_detail_ttl_seconds,
+                    detail_cache_max_entries=app.state.career_delta_detail_cache_max_entries,
+                ),
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         elapsed_ms = round((loop.time() - started) * 1000, 3)
@@ -518,6 +745,27 @@ def _register_routes(app: FastAPI) -> None:
             allowed_delta_types=request.selected_delta_types(),
             analysis_time_ms=elapsed_ms,
         )
+
+    @app.get("/api/career-delta/{scenario_id}/detail", response_model=CareerDeltaScenarioDetail)
+    async def career_delta_detail(
+        scenario_id: str,
+        engine: SemanticSearchEngine = Depends(get_engine),
+    ) -> CareerDeltaScenarioDetail:
+        """Return cached detail for a previously emitted scenario."""
+        loop = asyncio.get_running_loop()
+        detail = await loop.run_in_executor(
+            _engine_executor,
+            partial(
+                _lookup_cached_scenario_detail,
+                engine,
+                scenario_id,
+                detail_cache_ttl_seconds=app.state.career_delta_detail_ttl_seconds,
+                detail_cache_max_entries=app.state.career_delta_detail_cache_max_entries,
+            ),
+        )
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"Unknown or expired scenario_id: {scenario_id}")
+        return CareerDeltaScenarioDetail.from_internal(detail)
 
     # -- Utility endpoints ----------------------------------------------------
 
