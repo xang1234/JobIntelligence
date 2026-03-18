@@ -622,6 +622,103 @@ class TestCareerDeltaEndpoint:
         assert internal_req.profile_text == "Senior data analyst with Python, SQL, and dashboarding experience."
         assert internal_req.limit == 6
 
+    def test_career_delta_analysis_surfaces_thin_market_and_degraded_flags(self, client, mock_engine):
+        mock_engine._career_delta_engine = MagicMock()
+        mock_engine._career_delta_engine.analyze.return_value = CareerDeltaResponse(
+            request=MagicMock(location="Singapore"),
+            baseline=BaselineMarketPosition(
+                position=MarketPosition.THIN,
+                reachable_jobs=2,
+                total_candidates=8,
+                fit_median=0.44,
+                fit_p90=0.67,
+                salary_band=SalaryBand(min_annual=84000, median_annual=96000, max_annual=114000),
+                top_industries=(MarketInsight(name="technology/data_and_ai", job_count=3, share_pct=37.5),),
+                notes=("Evidence is limited.",),
+                thin_market=True,
+                degraded=True,
+            ),
+            summaries=(
+                ScenarioSummary(
+                    scenario_id="skill_addition:thin",
+                    scenario_type=ScenarioType.SKILL_ADDITION,
+                    title="Add Spark",
+                    summary="Add Spark to widen access to modern data roles.",
+                    market_position=MarketPosition.STRETCH,
+                    confidence=ScenarioConfidence(score=0.58, evidence_coverage=0.33, market_sample_size=8),
+                    thin_market=True,
+                    degraded=True,
+                ),
+            ),
+            degraded=True,
+            thin_market=True,
+        )
+
+        resp = client.post(
+            "/api/career-delta",
+            json={"profile_text": "Senior data analyst with Python, SQL, and dashboarding experience."},
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["degraded"] is True
+        assert data["thin_market"] is True
+        assert data["baseline"]["thin_market"] is True
+        assert data["baseline"]["degraded"] is True
+        assert data["scenarios"][0]["thin_market"] is True
+        assert data["scenarios"][0]["degraded"] is True
+
+    def test_career_delta_analysis_surfaces_budget_exhausted_partial_results(self, client, mock_engine):
+        mock_engine._career_delta_engine = MagicMock()
+        mock_engine._career_delta_engine.analyze.return_value = CareerDeltaResponse(
+            request=MagicMock(location="Singapore"),
+            baseline=BaselineMarketPosition(
+                position=MarketPosition.COMPETITIVE,
+                reachable_jobs=10,
+                total_candidates=28,
+                fit_median=0.63,
+                fit_p90=0.82,
+                salary_band=SalaryBand(min_annual=90000, median_annual=115000, max_annual=150000),
+            ),
+            summaries=(
+                ScenarioSummary(
+                    scenario_id="title_pivot:kept",
+                    scenario_type=ScenarioType.TITLE_PIVOT,
+                    title="Pivot toward Platform Engineer",
+                    summary="Move toward platform engineering.",
+                    market_position=MarketPosition.COMPETITIVE,
+                    confidence=ScenarioConfidence(score=0.79, evidence_coverage=0.52, market_sample_size=18),
+                    degraded=True,
+                ),
+            ),
+            filtered_scenarios=(
+                FilteredScenario(
+                    scenario_id="skill_addition:budget",
+                    scenario_type=ScenarioType.SKILL_ADDITION,
+                    reason_code="budget_exhausted",
+                    explanation="Scenario evaluation stopped early to stay within the compute budget.",
+                    confidence=ScenarioConfidence(score=0.4, evidence_coverage=0.2, market_sample_size=6),
+                ),
+            ),
+            degraded=True,
+            thin_market=False,
+        )
+
+        resp = client.post(
+            "/api/career-delta",
+            json={
+                "profile_text": "Senior data analyst with Python, SQL, and dashboarding experience.",
+                "include_filtered": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["degraded"] is True
+        assert data["thin_market"] is False
+        assert data["filtered_scenarios"][0]["reason_code"] == "budget_exhausted"
+        assert "compute budget" in data["filtered_scenarios"][0]["explanation"]
+
     def test_career_delta_detail_returns_cached_detail(self, client, mock_engine):
         mock_engine._career_delta_engine = MagicMock()
         mock_engine._career_delta_engine.analyze.return_value = CareerDeltaResponse(
@@ -802,6 +899,49 @@ class TestCareerDeltaEndpoint:
             "/api/career-delta",
             json={"profile_text": "too short"},
         )
+        assert resp.status_code == 422
+
+    def test_career_delta_validation_rejects_invalid_delta_type(self, client):
+        resp = client.post(
+            "/api/career-delta",
+            json={
+                "profile_text": "Senior data analyst with Python, SQL, and dashboarding experience.",
+                "delta_types": ["unknown_delta"],
+            },
+        )
+
+        assert resp.status_code == 422
+
+    def test_career_delta_validation_rejects_too_many_target_titles(self, client):
+        resp = client.post(
+            "/api/career-delta",
+            json={
+                "profile_text": "Senior data analyst with Python, SQL, and dashboarding experience.",
+                "target_titles": [
+                    "Title 1",
+                    "Title 2",
+                    "Title 3",
+                    "Title 4",
+                    "Title 5",
+                    "Title 6",
+                    "Title 7",
+                    "Title 8",
+                    "Title 9",
+                ],
+            },
+        )
+
+        assert resp.status_code == 422
+
+    def test_career_delta_validation_rejects_invalid_max_scenarios(self, client):
+        resp = client.post(
+            "/api/career-delta",
+            json={
+                "profile_text": "Senior data analyst with Python, SQL, and dashboarding experience.",
+                "max_scenarios": 0,
+            },
+        )
+
         assert resp.status_code == 422
 
     def test_career_delta_no_engine(self, client_no_engine):
