@@ -25,10 +25,16 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from ..mcf.career_delta import CareerDeltaDependencies, CareerDeltaEngine
+from ..mcf.career_delta_retrieval import SearchEngineCareerDeltaProvider
 from ..mcf.embeddings import SemanticSearchEngine
 from ..mcf.embeddings.models import SimilarJobsRequest as InternalSimilarJobsRequest
+from ..mcf.industry_taxonomy import normalize_title_family
+from ..mcf.market_stats import MarketStatsCache
 from .middleware import RateLimitMiddleware, RequestLoggingMiddleware
 from .models import (
+    CareerDeltaAnalysisRequest,
+    CareerDeltaAnalysisResponse,
     CompanySimilarity,
     CompanySimilarityRequest,
     CompanyTrendResponse,
@@ -70,6 +76,33 @@ _search_engine: Optional[SemanticSearchEngine] = None
 # concurrent mutation of TTLCache and other non-thread-safe state.
 # FAISS/numpy still release the GIL, so CPU work parallelizes natively.
 _engine_executor = ThreadPoolExecutor(max_workers=1)
+
+
+class _CareerDeltaTaxonomyHelper:
+    """Minimal adapter satisfying the engine's taxonomy dependency."""
+
+    @staticmethod
+    def normalize_title_family(title: str):
+        return normalize_title_family(title)
+
+
+def _get_career_delta_engine(engine: SemanticSearchEngine) -> CareerDeltaEngine:
+    """Lazily construct and cache the career-delta engine on the backend engine."""
+    cached = getattr(engine, "_career_delta_engine", None)
+    if cached is not None:
+        return cached
+
+    market_stats = MarketStatsCache(engine.db)
+    search_scoring = SearchEngineCareerDeltaProvider(engine)
+    career_engine = CareerDeltaEngine(
+        CareerDeltaDependencies(
+            taxonomy=_CareerDeltaTaxonomyHelper(),
+            market_stats=market_stats,
+            search_scoring=search_scoring,
+        )
+    )
+    setattr(engine, "_career_delta_engine", career_engine)
+    return career_engine
 
 
 @asynccontextmanager
@@ -463,6 +496,27 @@ def _register_routes(app: FastAPI) -> None:
             total_candidates=raw["total_candidates"],
             search_time_ms=raw["search_time_ms"],
             degraded=raw["degraded"],
+        )
+
+    @app.post("/api/career-delta", response_model=CareerDeltaAnalysisResponse)
+    async def career_delta_analysis(
+        request: CareerDeltaAnalysisRequest,
+        engine: SemanticSearchEngine = Depends(get_engine),
+    ) -> CareerDeltaAnalysisResponse:
+        """Run career-delta analysis through the serialized backend executor."""
+        loop = asyncio.get_running_loop()
+        internal_req = request.to_internal()
+        executor = _get_career_delta_engine(engine)
+        started = loop.time()
+        try:
+            internal_resp = await loop.run_in_executor(_engine_executor, executor.analyze, internal_req)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        elapsed_ms = round((loop.time() - started) * 1000, 3)
+        return CareerDeltaAnalysisResponse.from_internal(
+            internal_resp,
+            allowed_delta_types=request.selected_delta_types(),
+            analysis_time_ms=elapsed_ms,
         )
 
     # -- Utility endpoints ----------------------------------------------------

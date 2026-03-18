@@ -10,6 +10,17 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from src.api.app import create_app, get_engine
+from src.mcf.career_delta import (
+    BaselineMarketPosition,
+    CareerDeltaResponse,
+    FilteredScenario,
+    MarketInsight,
+    MarketPosition,
+    SalaryBand,
+    ScenarioConfidence,
+    ScenarioSummary,
+    ScenarioType,
+)
 
 # =============================================================================
 # Fixtures
@@ -553,6 +564,135 @@ class TestMarketIntelligenceEndpoints:
         assert data["extracted_skills"] == ["Python", "SQL"]
         assert data["total_candidates"] == 24
         mock_engine.match_profile.assert_called_once()
+
+
+class TestCareerDeltaEndpoint:
+    def test_career_delta_analysis(self, client, mock_engine):
+        mock_engine._career_delta_engine = MagicMock()
+        mock_engine._career_delta_engine.analyze.return_value = CareerDeltaResponse(
+            request=None,
+            baseline=BaselineMarketPosition(
+                position=MarketPosition.COMPETITIVE,
+                reachable_jobs=12,
+                total_candidates=30,
+                fit_median=0.61,
+                fit_p90=0.8,
+                salary_band=SalaryBand(min_annual=90000, median_annual=110000, max_annual=140000),
+                top_industries=(MarketInsight(name="technology/platform", job_count=8, share_pct=40.0),),
+            ),
+            summaries=(
+                ScenarioSummary(
+                    scenario_id="skill_addition:abc",
+                    scenario_type=ScenarioType.SKILL_ADDITION,
+                    title="Add Kubernetes",
+                    summary="Add Kubernetes to access more platform roles.",
+                    market_position=MarketPosition.COMPETITIVE,
+                    confidence=ScenarioConfidence(score=0.82, evidence_coverage=0.6, market_sample_size=20),
+                ),
+            ),
+            filtered_scenarios=(
+                FilteredScenario(
+                    scenario_id="title_pivot:abc",
+                    scenario_type=ScenarioType.TITLE_PIVOT,
+                    reason_code="overlapping_scenario",
+                    explanation="A better overlapping pivot was kept.",
+                    confidence=ScenarioConfidence(score=0.62, evidence_coverage=0.4, market_sample_size=12),
+                ),
+            ),
+            degraded=False,
+            thin_market=False,
+        )
+
+        resp = client.post(
+            "/api/career-delta",
+            json={
+                "profile_text": "Senior data analyst with Python, SQL, and dashboarding experience.",
+                "max_scenarios": 6,
+                "include_filtered": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["baseline"]["position"] == "competitive"
+        assert data["scenarios"][0]["scenario_type"] == "skill_addition"
+        assert data["filtered_scenarios"][0]["reason_code"] == "overlapping_scenario"
+        assert data["analysis_time_ms"] >= 0
+        internal_req = mock_engine._career_delta_engine.analyze.call_args[0][0]
+        assert internal_req.profile_text == "Senior data analyst with Python, SQL, and dashboarding experience."
+        assert internal_req.limit == 6
+
+    def test_career_delta_analysis_filters_requested_types(self, client, mock_engine):
+        mock_engine._career_delta_engine = MagicMock()
+        mock_engine._career_delta_engine.analyze.return_value = CareerDeltaResponse(
+            request=None,
+            summaries=(
+                ScenarioSummary(
+                    scenario_id="skill_addition:abc",
+                    scenario_type=ScenarioType.SKILL_ADDITION,
+                    title="Add Kubernetes",
+                    summary="Add Kubernetes.",
+                    market_position=MarketPosition.COMPETITIVE,
+                    confidence=ScenarioConfidence(score=0.82, evidence_coverage=0.6, market_sample_size=20),
+                ),
+                ScenarioSummary(
+                    scenario_id="title_pivot:abc",
+                    scenario_type=ScenarioType.TITLE_PIVOT,
+                    title="Pivot toward Platform Engineer",
+                    summary="Move into platform engineering.",
+                    market_position=MarketPosition.STRETCH,
+                    confidence=ScenarioConfidence(score=0.7, evidence_coverage=0.5, market_sample_size=16),
+                ),
+            ),
+            filtered_scenarios=(
+                FilteredScenario(
+                    scenario_id="skill_substitution:abc",
+                    scenario_type=ScenarioType.SKILL_SUBSTITUTION,
+                    reason_code="low_signal",
+                    explanation="Weak evidence.",
+                    confidence=ScenarioConfidence(score=0.3, evidence_coverage=0.2, market_sample_size=4),
+                ),
+            ),
+        )
+
+        resp = client.post(
+            "/api/career-delta",
+            json={
+                "profile_text": "Senior data analyst with Python, SQL, and dashboarding experience.",
+                "delta_types": ["title_pivot"],
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert [item["scenario_type"] for item in data["scenarios"]] == ["title_pivot"]
+        assert data["filtered_scenarios"] == []
+
+    def test_career_delta_validation_error(self, client):
+        resp = client.post(
+            "/api/career-delta",
+            json={"profile_text": "too short"},
+        )
+        assert resp.status_code == 422
+
+    def test_career_delta_no_engine(self, client_no_engine):
+        resp = client_no_engine.post(
+            "/api/career-delta",
+            json={"profile_text": "Senior data analyst with Python, SQL, and dashboarding experience."},
+        )
+        assert resp.status_code == 503
+
+    def test_career_delta_value_error(self, client, mock_engine):
+        mock_engine._career_delta_engine = MagicMock()
+        mock_engine._career_delta_engine.analyze.side_effect = ValueError("thin market request could not be analyzed")
+
+        resp = client.post(
+            "/api/career-delta",
+            json={"profile_text": "Senior data analyst with Python, SQL, and dashboarding experience."},
+        )
+
+        assert resp.status_code == 400
+        assert resp.json()["error"]["message"] == "thin market request could not be analyzed"
 
 
 # =============================================================================
