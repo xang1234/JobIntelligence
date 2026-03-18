@@ -1,5 +1,11 @@
 import random
+from datetime import date
 
+import pytest
+
+import src.mcf.database as database_module
+import src.mcf.embeddings.search_engine as search_engine_module
+import src.mcf.market_stats as market_stats_module
 from src.mcf.career_delta import (
     CareerDeltaDependencies,
     CareerDeltaEngine,
@@ -18,7 +24,22 @@ from src.mcf.industry_taxonomy import normalize_title_family
 from src.mcf.market_stats import MarketStatsCache
 from src.mcf.models import Category
 
+from . import factories
 from .factories import generate_metadata, generate_test_job
+
+
+class _FrozenDate(date):
+    @classmethod
+    def today(cls) -> "_FrozenDate":
+        return cls(2026, 3, 18)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_integration_calendar(monkeypatch):
+    monkeypatch.setattr(factories, "date", _FrozenDate)
+    monkeypatch.setattr(database_module, "date", _FrozenDate)
+    monkeypatch.setattr(market_stats_module, "date", _FrozenDate)
+    monkeypatch.setattr(search_engine_module, "date", _FrozenDate)
 
 
 class _TaxonomyAdapter:
