@@ -324,8 +324,8 @@ class MCFDatabase:
         'delete' checkpoints the WAL and removes the -shm file so the
         database can be safely bind-mounted into a container.
 
-        The host scraper re-enables WAL via write_optimized=True when it
-        runs, so this is safe to call unconditionally at startup.
+        When a journal mode override is active, write_optimized=True
+        connections skip the WAL pragma to avoid reverting the override.
         """
         target = (
             self._journal_mode
