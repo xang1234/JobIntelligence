@@ -276,7 +276,9 @@ class MCFDatabase:
             conn.execute("PRAGMA query_only = ON")
 
         if write_optimized:
-            conn.execute("PRAGMA journal_mode = WAL")
+            # Only enable WAL if no explicit journal mode override is active.
+            if not self._journal_mode and not os.environ.get("MCF_SQLITE_JOURNAL_MODE"):
+                conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute("PRAGMA temp_store = MEMORY")
 
@@ -490,36 +492,43 @@ class MCFDatabase:
             conn.close()
 
     def _repair_fts5(self) -> sqlite3.Connection:
-        """Drop malformed FTS5 tables and recreate from scratch."""
+        """Drop malformed FTS5 tables and recreate from scratch.
+
+        Returns an open connection that the caller must commit and close.
+        On failure, the connection is closed before re-raising.
+        """
         conn = self._connect()
-        # Try normal DROP first for each shadow table individually.
-        suffixes = ("", "_data", "_idx", "_content", "_docsize", "_config")
-        all_dropped = True
-        for suffix in suffixes:
-            table = f"jobs_fts{suffix}"
-            try:
-                conn.executescript(f"DROP TABLE IF EXISTS {table};")
-            except Exception:
-                logger.warning("Could not DROP %s normally", table)
-                all_dropped = False
+        try:
+            # Try normal DROP first for each shadow table individually.
+            suffixes = ("", "_data", "_idx", "_content", "_docsize", "_config")
+            all_dropped = True
+            for suffix in suffixes:
+                table = f"jobs_fts{suffix}"
+                try:
+                    conn.executescript(f"DROP TABLE IF EXISTS {table};")
+                except Exception:
+                    logger.warning("Could not DROP %s normally", table)
+                    all_dropped = False
 
-        if not all_dropped:
-            # Corruption prevents normal DROP — forcibly remove table
-            # entries from sqlite_master and reclaim space with VACUUM.
-            logger.warning("Using writable_schema to remove corrupted FTS tables")
-            conn.execute("PRAGMA writable_schema = ON")
-            conn.execute(
-                "DELETE FROM sqlite_master WHERE name LIKE 'jobs_fts%'"
-            )
-            conn.execute("PRAGMA writable_schema = OFF")
-            conn.commit()
-            # VACUUM reclaims orphaned pages from the corrupted tables.
-            conn.execute("VACUUM")
+            if not all_dropped:
+                # Corruption prevents normal DROP — forcibly remove table
+                # entries from sqlite_master and reclaim space with VACUUM.
+                logger.warning("Using writable_schema to remove corrupted FTS tables")
+                conn.execute("PRAGMA writable_schema = ON")
+                conn.execute(
+                    "DELETE FROM sqlite_master WHERE name LIKE 'jobs_fts%'"
+                )
+                conn.execute("PRAGMA writable_schema = OFF")
+                conn.commit()
+                # VACUUM reclaims orphaned pages from the corrupted tables.
+                conn.execute("VACUUM")
 
-        conn.executescript(FTS5_SCHEMA)
-        conn.execute("INSERT INTO jobs_fts(jobs_fts) VALUES('rebuild')")
-        logger.info("FTS5 index rebuilt after recovery")
-        return conn
+            conn.executescript(FTS5_SCHEMA)
+            conn.execute("INSERT INTO jobs_fts(jobs_fts) VALUES('rebuild')")
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
     def upsert_job(
         self,
