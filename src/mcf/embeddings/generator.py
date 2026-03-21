@@ -373,7 +373,7 @@ class EmbeddingGenerator:
 
         Unlike generate_company_embeddings() which encodes raw Job text, this method
         reuses embeddings already stored in the database — avoiding redundant model
-        inference.
+        inference. Uses a single bulk JOIN query instead of per-company lookups.
 
         For companies with >= 10 embedded jobs: K-means clustering into job families
         For companies with < 10 embedded jobs: Single mean centroid
@@ -387,24 +387,18 @@ class EmbeddingGenerator:
         """
         from sklearn.cluster import KMeans
 
-        companies = db.get_all_companies()
+        # Single bulk query replaces ~132K individual queries
+        company_embeddings_map = db.get_company_job_embeddings_bulk()
         company_centroids: dict[str, list[np.ndarray]] = {}
 
-        logger.info(f"Generating centroids for {len(companies)} companies from stored embeddings")
+        total = len(company_embeddings_map)
+        logger.info(f"Generating centroids for {total} companies from stored embeddings")
 
-        for company in companies:
-            # Get job UUIDs for this company
-            jobs = db.search_jobs(company_name=company, limit=100000)
-            if not jobs:
+        for idx, (company, embeddings_list) in enumerate(company_embeddings_map.items()):
+            if not embeddings_list:
                 continue
 
-            job_uuids = [j["uuid"] for j in jobs]
-            embeddings_dict = db.get_embeddings_for_uuids(job_uuids)
-
-            if not embeddings_dict:
-                continue
-
-            job_embeddings = np.array(list(embeddings_dict.values()), dtype=np.float32)
+            job_embeddings = np.array(embeddings_list, dtype=np.float32)
 
             if len(job_embeddings) < 10:
                 # Single mean centroid for small companies
@@ -429,6 +423,9 @@ class EmbeddingGenerator:
                     centroids.append(centroid.astype(np.float32))
 
                 company_centroids[company] = centroids
+
+            if (idx + 1) % 5000 == 0:
+                logger.info(f"  Company centroids: {idx + 1}/{total} processed")
 
         logger.info(
             f"Generated centroids for {len(company_centroids)} companies "
@@ -471,6 +468,7 @@ class EmbeddingGenerator:
         skip_existing: bool = True,
         progress_callback: Optional[Callable[[EmbeddingStats], None]] = None,
         output_dir: Path = Path("data/embeddings"),
+        since: "date | None" = None,
     ) -> EmbeddingStats:
         """
         Generate all embeddings: jobs, skills (with clustering), companies.
@@ -484,6 +482,7 @@ class EmbeddingGenerator:
             skip_existing: Skip jobs that already have embeddings
             progress_callback: Called with stats after each batch
             output_dir: Directory for skill cluster output files
+            since: Only process jobs posted on or after this date
 
         Returns:
             EmbeddingStats with processing metrics
@@ -495,23 +494,25 @@ class EmbeddingGenerator:
 
         # Step 1: Count jobs to process
         if skip_existing:
-            jobs_to_process = db.get_jobs_without_embeddings(limit=1000000)
+            jobs_to_process = db.get_jobs_without_embeddings(limit=1000000, since=since)
             stats.jobs_total = len(jobs_to_process)
             if jobs_to_process:
                 db.populate_normalized_job_metadata([job["uuid"] for job in jobs_to_process])
         else:
-            stats.jobs_total = db.count_jobs()
             jobs_to_process = None
-
-        logger.info(f"Starting embedding generation for {stats.jobs_total} jobs")
 
         # Step 2: Generate job embeddings in batches
         if jobs_to_process is None:
             # Process all jobs (need to iterate through them)
-            all_uuids = list(db.get_all_uuids())
+            if since is not None:
+                all_uuids = list(db.get_all_uuids_since(since))
+            else:
+                all_uuids = list(db.get_all_uuids())
             stats.jobs_total = len(all_uuids)
             if all_uuids:
                 db.populate_normalized_job_metadata(all_uuids)
+
+            logger.info(f"Starting embedding generation for {stats.jobs_total} jobs")
 
             for i in range(0, len(all_uuids), batch_size):
                 batch_uuids = all_uuids[i : i + batch_size]
@@ -521,6 +522,7 @@ class EmbeddingGenerator:
                 if progress_callback:
                     progress_callback(stats)
         else:
+            logger.info(f"Starting embedding generation for {stats.jobs_total} jobs")
             # Process jobs that need embeddings
             for i in range(0, len(jobs_to_process), batch_size):
                 batch = jobs_to_process[i : i + batch_size]

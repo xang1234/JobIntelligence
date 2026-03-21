@@ -2754,7 +2754,35 @@ class MCFDatabase:
 
         return sorted([row[0] for row in rows])
 
-    def get_jobs_without_embeddings(self, limit: int = 1000) -> list[dict]:
+    def get_company_job_embeddings_bulk(self) -> dict[str, list[np.ndarray]]:
+        """
+        Fetch all job embeddings grouped by company in a single query.
+
+        Replaces the N+1 pattern of querying per-company with one JOIN.
+        Used by company centroid generation.
+
+        Returns:
+            Dict mapping company_name -> list of embedding arrays
+        """
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT j.company_name, e.embedding_blob
+                FROM jobs j
+                JOIN embeddings e ON e.entity_id = j.uuid AND e.entity_type = 'job'
+                WHERE j.company_name IS NOT NULL AND j.company_name != ''
+                ORDER BY j.company_name
+                """
+            ).fetchall()
+
+        result: dict[str, list[np.ndarray]] = defaultdict(list)
+        for row in rows:
+            result[row["company_name"]].append(
+                np.frombuffer(row["embedding_blob"], dtype=np.float32)
+            )
+        return dict(result)
+
+    def get_jobs_without_embeddings(self, limit: int = 1000, since: "date | None" = None) -> list[dict]:
         """
         Get jobs that don't have embeddings yet.
 
@@ -2762,20 +2790,41 @@ class MCFDatabase:
 
         Args:
             limit: Maximum jobs to return
+            since: Only include jobs posted on or after this date
 
         Returns:
             List of job dicts with uuid, title, description, skills
         """
         with self._connection() as conn:
-            rows = conn.execute(
-                """
+            query = """
                 SELECT j.uuid, j.title, j.description, j.skills, j.company_name
                 FROM jobs j
                 LEFT JOIN embeddings e ON j.uuid = e.entity_id AND e.entity_type = 'job'
                 WHERE e.id IS NULL
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+                """
+            params: list = []
+            if since is not None:
+                query += " AND j.posted_date >= ?"
+                params.append(since.isoformat())
+            query += " LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
 
         return [dict(row) for row in rows]
+
+    def get_all_uuids_since(self, since: "date") -> set[str]:
+        """Get set of all job UUIDs posted on or after a date."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT uuid FROM jobs WHERE posted_date >= ?",
+                (since.isoformat(),),
+            ).fetchall()
+            return {row[0] for row in rows}
+
+    def count_jobs_since(self, since: "date") -> int:
+        """Count jobs posted on or after a date."""
+        with self._connection() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE posted_date >= ?",
+                (since.isoformat(),),
+            ).fetchone()[0]
