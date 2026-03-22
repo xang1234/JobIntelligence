@@ -278,9 +278,21 @@ async def lifespan(app: FastAPI):
 
     db_path = app.state.db_path
     index_dir = Path(app.state.index_dir)
+    embedding_backend = app.state.embedding_backend
+    onnx_model_dir = app.state.onnx_model_dir
 
-    logger.info("Loading search indexes (db=%s, index_dir=%s)...", db_path, index_dir)
-    _search_engine = SemanticSearchEngine(db_path=db_path, index_dir=index_dir)
+    logger.info(
+        "Loading search indexes (db=%s, index_dir=%s, embedding_backend=%s)...",
+        db_path,
+        index_dir,
+        embedding_backend,
+    )
+    _search_engine = SemanticSearchEngine(
+        db_path=db_path,
+        index_dir=index_dir,
+        embedding_backend=embedding_backend,
+        onnx_model_dir=onnx_model_dir,
+    )
 
     # Load in a thread to avoid blocking the event loop during startup
     loop = asyncio.get_running_loop()
@@ -307,6 +319,8 @@ def get_engine() -> SemanticSearchEngine:
 def create_app(
     db_path: str | None = None,
     index_dir: str | None = None,
+    embedding_backend: str | None = None,
+    onnx_model_dir: str | None = None,
     cors_origins: Optional[list[str]] = None,
     rate_limit_rpm: int | None = None,
     trusted_proxies: frozenset[str] | None = None,
@@ -319,6 +333,10 @@ def create_app(
             ``MCF_DB_PATH`` env var, then ``"data/mcf_jobs.db"``.
         index_dir: Directory containing FAISS indexes.  Falls back to
             ``MCF_INDEX_DIR`` env var, then ``"data/embeddings"``.
+        embedding_backend: Embedding inference backend. Falls back to
+            ``MCF_EMBEDDING_BACKEND`` env var, then ``"torch"``.
+        onnx_model_dir: Exported ONNX model directory. Falls back to
+            ``MCF_ONNX_MODEL_DIR`` env var when provided.
         cors_origins: Allowed CORS origins.  Falls back to
             ``MCF_CORS_ORIGINS`` env var (comma-separated), then
             common localhost ports.
@@ -336,6 +354,10 @@ def create_app(
         db_path = os.environ.get("MCF_DB_PATH", "data/mcf_jobs.db")
     if index_dir is None:
         index_dir = os.environ.get("MCF_INDEX_DIR", "data/embeddings")
+    if embedding_backend is None:
+        embedding_backend = os.environ.get("MCF_EMBEDDING_BACKEND", "torch")
+    if onnx_model_dir is None:
+        onnx_model_dir = os.environ.get("MCF_ONNX_MODEL_DIR")
     if cors_origins is None:
         env_origins = os.environ.get("MCF_CORS_ORIGINS")
         if env_origins:
@@ -363,6 +385,8 @@ def create_app(
     # Store config on app state so lifespan can access it
     app.state.db_path = db_path
     app.state.index_dir = index_dir
+    app.state.embedding_backend = embedding_backend
+    app.state.onnx_model_dir = onnx_model_dir
     app.state.rate_limit_rpm = rate_limit_rpm
     app.state.career_delta_detail_ttl_seconds = 300
     app.state.career_delta_detail_cache_max_entries = 256

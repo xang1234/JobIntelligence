@@ -33,6 +33,14 @@ Example:
         print(f"{job.title} at {job.company_name}: {job.similarity_score:.3f}")
 """
 
+from .backends import (
+    DEFAULT_EMBEDDING_BACKEND,
+    EmbeddingBackend,
+    OnnxEmbeddingBackend,
+    TorchSentenceTransformerBackend,
+    create_embedding_backend,
+    export_sentence_transformer_to_onnx,
+)
 from .generator import EmbeddingGenerator
 from .index_manager import (
     FAISSIndexManager,
@@ -59,6 +67,12 @@ __all__ = [
     "EmbeddingGenerator",
     "EmbeddingStats",
     "SkillClusterResult",
+    "EmbeddingBackend",
+    "TorchSentenceTransformerBackend",
+    "OnnxEmbeddingBackend",
+    "DEFAULT_EMBEDDING_BACKEND",
+    "create_embedding_backend",
+    "export_sentence_transformer_to_onnx",
     # Index management
     "FAISSIndexManager",
     "IndexNotBuiltError",

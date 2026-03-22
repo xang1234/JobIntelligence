@@ -11,7 +11,7 @@ Tests cover the full pipeline:
 
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -487,17 +487,15 @@ class TestGenerateAllIncludesCompanies:
         mock_embeddings = np.random.randn(384).astype(np.float32)
         mock_embeddings = mock_embeddings / np.linalg.norm(mock_embeddings)
 
-        with patch.object(generator, "_model") as mock_model:
-            mock_model.encode = lambda text, **kwargs: (
-                mock_embeddings if isinstance(text, str) else np.tile(mock_embeddings, (len(text), 1))
-            )
-            # Directly set the model so the property doesn't re-load
-            generator._model = mock_model
+        mock_backend = Mock()
+        mock_backend.encode_one.side_effect = lambda text, **kwargs: mock_embeddings
+        mock_backend.encode_batch.side_effect = lambda texts, **kwargs: np.tile(mock_embeddings, (len(texts), 1))
+        generator._backend = mock_backend
 
-            stats = generator.generate_all(
-                db_with_companies,
-                skip_existing=True,  # Jobs already have embeddings
-            )
+        stats = generator.generate_all(
+            db_with_companies,
+            skip_existing=True,  # Jobs already have embeddings
+        )
 
         assert stats.companies_processed == 3
 
@@ -525,12 +523,11 @@ class TestGenerateAllIncludesCompanies:
         mock_embeddings = np.random.randn(384).astype(np.float32)
         mock_embeddings = mock_embeddings / np.linalg.norm(mock_embeddings)
 
-        with patch.object(generator, "_model") as mock_model:
-            mock_model.encode = lambda text, **kwargs: (
-                mock_embeddings if isinstance(text, str) else np.tile(mock_embeddings, (len(text), 1))
-            )
-            generator._model = mock_model
-            generator.generate_all(db, skip_existing=True)
+        mock_backend = Mock()
+        mock_backend.encode_one.side_effect = lambda text, **kwargs: mock_embeddings
+        mock_backend.encode_batch.side_effect = lambda texts, **kwargs: np.tile(mock_embeddings, (len(texts), 1))
+        generator._backend = mock_backend
+        generator.generate_all(db, skip_existing=True)
 
         stored = db.get_job(job.uuid)
         assert stored is not None
@@ -562,12 +559,11 @@ class TestGenerateAllIncludesCompanies:
         mock_embeddings = np.random.randn(384).astype(np.float32)
         mock_embeddings = mock_embeddings / np.linalg.norm(mock_embeddings)
 
-        with patch.object(generator, "_model") as mock_model:
-            mock_model.encode = lambda text, **kwargs: (
-                mock_embeddings if isinstance(text, str) else np.tile(mock_embeddings, (len(text), 1))
-            )
-            generator._model = mock_model
-            generator.generate_all(db, skip_existing=False)
+        mock_backend = Mock()
+        mock_backend.encode_one.side_effect = lambda text, **kwargs: mock_embeddings
+        mock_backend.encode_batch.side_effect = lambda texts, **kwargs: np.tile(mock_embeddings, (len(texts), 1))
+        generator._backend = mock_backend
+        generator.generate_all(db, skip_existing=False)
 
         stored = db.get_job(job.uuid)
         assert stored is not None

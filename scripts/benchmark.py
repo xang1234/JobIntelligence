@@ -116,18 +116,18 @@ def benchmark_embedding(generator: EmbeddingGenerator, n_texts: int) -> dict:
 
     # Warmup: ensure model is loaded before timing
     console.print("[dim]Warming up embedding model...[/dim]")
-    generator.model.encode("warmup query")
+    generator.backend.encode_one("warmup query")
 
     # Single embedding latency (average of 10 runs)
     single_times = []
     for text in texts[:10]:
         start = time.perf_counter()
-        generator.model.encode(text)
+        generator.backend.encode_one(text)
         single_times.append((time.perf_counter() - start) * 1000)
 
     # Batch embedding throughput
     start = time.perf_counter()
-    generator.model.encode(texts, batch_size=32)
+    generator.backend.encode_batch(texts, batch_size=32)
     batch_total_ms = (time.perf_counter() - start) * 1000
 
     return {
@@ -328,15 +328,33 @@ def main() -> int:
     parser.add_argument(
         "--index-dir", type=str, default="data/embeddings", help="Index directory"
     )
+    parser.add_argument(
+        "--embedding-backend",
+        type=str,
+        default="torch",
+        help="Embedding inference backend: torch or onnx",
+    )
+    parser.add_argument(
+        "--onnx-model-dir",
+        type=str,
+        default=None,
+        help="Exported ONNX model directory when using --embedding-backend onnx",
+    )
     args = parser.parse_args()
 
     console.print("[bold]MCF Semantic Search Benchmark[/bold]")
+    console.print(f"[dim]Embedding backend: {args.embedding_backend}[/dim]")
     console.print()
 
     # --- Load engine ---
     console.print("[dim]Loading search engine...[/dim]")
     index_dir = Path(args.index_dir)
-    engine = SemanticSearchEngine(args.db, index_dir)
+    engine = SemanticSearchEngine(
+        args.db,
+        index_dir,
+        embedding_backend=args.embedding_backend,
+        onnx_model_dir=args.onnx_model_dir,
+    )
     engine.load()
 
     if engine._degraded:

@@ -8,13 +8,17 @@ Usage:
     python -m src.cli status
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import sqlite3
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
@@ -38,11 +42,13 @@ from src.mcf import (
     ScraperDaemon,
 )
 from src.mcf.embeddings import (
+    DEFAULT_EMBEDDING_BACKEND,
     FAISSIndexManager,
     IndexCompatibilityError,
     SearchRequest,
     SearchResponse,
     SemanticSearchEngine,
+    export_sentence_transformer_to_onnx,
 )
 
 app = typer.Typer(
@@ -53,12 +59,32 @@ app = typer.Typer(
 console = Console()
 
 
-def _parse_since_date(since: Optional[str]) -> "date | None":
+def _default_onnx_model_dir(model_name: str) -> Path:
+    """Return the default export directory for an ONNX embedding model."""
+    safe_name = model_name.replace("/", "--")
+    return Path("data/models") / f"{safe_name}-onnx"
+
+
+def _create_embedding_generator(
+    *,
+    model_name: str | None = None,
+    backend: str = DEFAULT_EMBEDDING_BACKEND,
+    device: str | None = None,
+    onnx_model_dir: str | Path | None = None,
+) -> EmbeddingGenerator:
+    """Create an embedding generator with the selected backend settings."""
+    return EmbeddingGenerator(
+        model_name=model_name,
+        device=device,
+        backend=backend,
+        onnx_model_dir=onnx_model_dir,
+    )
+
+
+def _parse_since_date(since: Optional[str]) -> date | None:
     """Parse a YYYY-MM-DD string into a date, or exit on bad format."""
     if since is None:
         return None
-    from datetime import date
-
     try:
         return date.fromisoformat(since)
     except ValueError:
@@ -1446,6 +1472,16 @@ def generate_embeddings(
     since: Optional[str] = typer.Option(
         None, "--since", help="Only embed jobs posted on or after this date (YYYY-MM-DD)"
     ),
+    embedding_backend: str = typer.Option(
+        DEFAULT_EMBEDDING_BACKEND,
+        "--embedding-backend",
+        help="Embedding inference backend: torch or onnx",
+    ),
+    onnx_model_dir: Optional[str] = typer.Option(
+        None,
+        "--onnx-model-dir",
+        help="Exported ONNX model directory when using --embedding-backend onnx",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
 ) -> None:
     """
@@ -1468,10 +1504,16 @@ def generate_embeddings(
     console.print("━" * 40)
 
     db = MCFDatabase(db_path)
-    generator = EmbeddingGenerator()
+    generator = _create_embedding_generator(
+        backend=embedding_backend,
+        onnx_model_dir=onnx_model_dir,
+    )
 
     console.print(f"Model: [green]{generator.model_name}[/green] ({generator.DIMENSION} dimensions)")
+    console.print(f"Backend: [green]{generator.backend_name}[/green]")
     console.print(f"Database: [green]{db_path}[/green]")
+    if generator.backend_name == "onnx" and generator.onnx_model_dir is not None:
+        console.print(f"ONNX dir: [green]{generator.onnx_model_dir}[/green]")
     if since_date:
         console.print(f"Since: [green]{since_date.isoformat()}[/green]")
     console.print()
@@ -1677,6 +1719,16 @@ def sync_embeddings(
     since: Optional[str] = typer.Option(
         None, "--since", help="Only sync jobs posted on or after this date (YYYY-MM-DD)"
     ),
+    embedding_backend: str = typer.Option(
+        DEFAULT_EMBEDDING_BACKEND,
+        "--embedding-backend",
+        help="Embedding inference backend: torch or onnx",
+    ),
+    onnx_model_dir: Optional[str] = typer.Option(
+        None,
+        "--onnx-model-dir",
+        help="Exported ONNX model directory when using --embedding-backend onnx",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
 ) -> None:
     """
@@ -1698,10 +1750,14 @@ def sync_embeddings(
     console.print("━" * 40)
 
     db = MCFDatabase(db_path)
-    generator = EmbeddingGenerator()
+    generator = _create_embedding_generator(
+        backend=embedding_backend,
+        onnx_model_dir=onnx_model_dir,
+    )
 
     if since_date:
         console.print(f"Since: [green]{since_date.isoformat()}[/green]")
+    console.print(f"Backend: [green]{generator.backend_name}[/green]")
 
     # Check how many jobs need embeddings
     jobs_to_process = db.get_jobs_without_embeddings(limit=1000000, since=since_date)
@@ -1934,6 +1990,16 @@ def upgrade_embeddings(
     model: str = typer.Argument(..., help="New model name (e.g., all-mpnet-base-v2)"),
     batch_size: int = typer.Option(32, "--batch-size", "-b", help="Jobs to process in each batch"),
     db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Path to SQLite database"),
+    embedding_backend: str = typer.Option(
+        DEFAULT_EMBEDDING_BACKEND,
+        "--embedding-backend",
+        help="Embedding inference backend: torch or onnx",
+    ),
+    onnx_model_dir: Optional[str] = typer.Option(
+        None,
+        "--onnx-model-dir",
+        help="Exported ONNX model directory when using --embedding-backend onnx",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
     confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
 ) -> None:
@@ -1963,7 +2029,13 @@ def upgrade_embeddings(
     # Show warning
     console.print("\n[bold yellow]⚠️  This will regenerate ALL embeddings![/bold yellow]\n")
     console.print(f"Current model: [cyan]{current_model}[/cyan]")
-    console.print(f"New model:     [green]{model}[/green]")
+    target_model_version = _create_embedding_generator(
+        model_name=model,
+        backend=embedding_backend,
+        onnx_model_dir=onnx_model_dir,
+    ).model_name
+    console.print(f"New model:     [green]{target_model_version}[/green]")
+    console.print(f"Backend:       [green]{embedding_backend}[/green]")
     console.print(f"Jobs to re-embed: [cyan]{total_jobs:,}[/cyan]")
 
     if current_embeddings > 0:
@@ -1994,10 +2066,14 @@ def upgrade_embeddings(
                 console.print(f"  Deleted {remaining:,} remaining embeddings")
 
     # Step 2: Generate new embeddings with new model
-    console.print(f"\nGenerating embeddings with [green]{model}[/green]...")
+    console.print(f"\nGenerating embeddings with [green]{target_model_version}[/green]...")
     console.print()
 
-    generator = EmbeddingGenerator(model_name=model)
+    generator = _create_embedding_generator(
+        model_name=model,
+        backend=embedding_backend,
+        onnx_model_dir=onnx_model_dir,
+    )
 
     with Progress(
         SpinnerColumn(),
@@ -2031,7 +2107,8 @@ def upgrade_embeddings(
     table.add_column("Metric", style="cyan")
     table.add_column("Value", justify="right")
 
-    table.add_row("New model", model)
+    table.add_row("New model", generator.model_name)
+    table.add_row("Backend", generator.backend_name)
     table.add_row("Jobs processed", f"{final_stats.jobs_processed:,}")
     table.add_row("Skills clustered", f"{final_stats.unique_skills:,}")
 
@@ -2044,6 +2121,153 @@ def upgrade_embeddings(
     table.add_row("Total time", elapsed_str)
 
     console.print(table)
+
+
+@app.command(name="embed-export-onnx")
+def export_embeddings_to_onnx(
+    model: str = typer.Argument(EmbeddingGenerator.MODEL_NAME, help="Sentence-transformers model to export"),
+    output_dir: Optional[str] = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="Directory for the exported ONNX model bundle",
+    ),
+    opset: int = typer.Option(17, "--opset", help="ONNX opset version"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite an existing export"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
+) -> None:
+    """Export a sentence-transformers encoder to an ONNX bundle for CPU inference."""
+    setup_logging(verbose)
+
+    export_dir = Path(output_dir) if output_dir else _default_onnx_model_dir(model)
+    console.print("\n[bold blue]Exporting ONNX Embedding Model[/bold blue]")
+    console.print(f"Model:      [green]{model}[/green]")
+    console.print(f"Output dir: [green]{export_dir}[/green]")
+    console.print(f"Opset:      [green]{opset}[/green]")
+    console.print()
+
+    model_path = export_sentence_transformer_to_onnx(
+        model,
+        export_dir,
+        dimension=EmbeddingGenerator.DIMENSION,
+        opset=opset,
+        overwrite=overwrite,
+    )
+
+    console.print(f"[green]✓ Exported ONNX model to {model_path}[/green]")
+
+
+@app.command(name="embed-compare-backends")
+def compare_embedding_backends(
+    model: str = typer.Option(EmbeddingGenerator.MODEL_NAME, "--model", help="Base embedding model name"),
+    onnx_model_dir: str = typer.Option(..., "--onnx-model-dir", help="Exported ONNX model directory"),
+    sample_size: int = typer.Option(24, "--sample-size", help="Representative texts to compare"),
+    db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Database path for sampling/search"),
+    index_dir: str = typer.Option("data/embeddings", "--index-dir", help="Torch FAISS index directory"),
+    onnx_index_dir: Optional[str] = typer.Option(
+        None,
+        "--onnx-index-dir",
+        help="Optional FAISS index directory rebuilt with ONNX embeddings",
+    ),
+    top_k: int = typer.Option(10, "--top-k", help="Top-k depth for search overlap"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
+) -> None:
+    """
+    Compare Torch and ONNX embedding outputs on representative text samples.
+
+    When --onnx-index-dir is provided, also compares top-k search overlap between
+    the existing Torch index directory and an ONNX-rebuilt index directory.
+    """
+    setup_logging(verbose)
+
+    db = MCFDatabase(db_path, read_only=True)
+    torch_generator = _create_embedding_generator(model_name=model, backend="torch")
+    onnx_generator = _create_embedding_generator(
+        model_name=model,
+        backend="onnx",
+        onnx_model_dir=onnx_model_dir,
+    )
+
+    benchmark_queries = [
+        "python developer",
+        "machine learning engineer",
+        "data scientist singapore",
+        "full stack javascript react",
+        "devops kubernetes aws",
+    ]
+
+    texts: list[str] = list(benchmark_queries)
+    texts.extend(db.get_all_unique_skills()[: max(1, sample_size // 3)])
+    for row in db.search_jobs(limit=max(1, sample_size)):
+        title = row.get("title", "")
+        description = (row.get("description") or "")[:240]
+        skills = row.get("skills", "")
+        texts.append(" ".join(part for part in (title, title, description, skills) if part))
+        if len(texts) >= sample_size:
+            break
+
+    deduped_texts: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        normalized = " ".join(text.split())
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped_texts.append(normalized)
+        if len(deduped_texts) >= sample_size:
+            break
+
+    torch_embeddings = torch_generator.backend.encode_batch(deduped_texts, batch_size=16, normalize_embeddings=True)
+    onnx_embeddings = onnx_generator.backend.encode_batch(deduped_texts, batch_size=16, normalize_embeddings=True)
+    cosine_scores = np.sum(torch_embeddings * onnx_embeddings, axis=1)
+
+    table = Table(title="Embedding Backend Parity")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Samples", f"{len(deduped_texts):,}")
+    table.add_row("Mean cosine", f"{float(np.mean(cosine_scores)):.6f}")
+    table.add_row("Min cosine", f"{float(np.min(cosine_scores)):.6f}")
+    table.add_row("Max cosine", f"{float(np.max(cosine_scores)):.6f}")
+    table.add_row("Torch model", torch_generator.model_name)
+    table.add_row("ONNX model", onnx_generator.model_name)
+    console.print()
+    console.print(table)
+
+    if onnx_index_dir:
+        torch_engine = SemanticSearchEngine(
+            db_path=db_path,
+            index_dir=Path(index_dir),
+            model_version=model,
+            embedding_backend="torch",
+        )
+        onnx_engine = SemanticSearchEngine(
+            db_path=db_path,
+            index_dir=Path(onnx_index_dir),
+            model_version=model,
+            embedding_backend="onnx",
+            onnx_model_dir=onnx_model_dir,
+        )
+        torch_engine.load()
+        onnx_engine.load()
+
+        overlap_scores: list[float] = []
+        for query in benchmark_queries:
+            torch_results = torch_engine.search(SearchRequest(query=query, limit=top_k)).results
+            onnx_results = onnx_engine.search(SearchRequest(query=query, limit=top_k)).results
+            torch_uuids = {result.uuid for result in torch_results}
+            onnx_uuids = {result.uuid for result in onnx_results}
+            overlap = len(torch_uuids & onnx_uuids) / max(1, top_k)
+            overlap_scores.append(overlap)
+
+        overlap_table = Table(title="Search Top-K Overlap")
+        overlap_table.add_column("Metric", style="cyan")
+        overlap_table.add_column("Value", justify="right")
+        overlap_table.add_row("Queries", f"{len(benchmark_queries):,}")
+        overlap_table.add_row("Mean overlap", f"{float(np.mean(overlap_scores)):.3f}")
+        overlap_table.add_row("Min overlap", f"{float(np.min(overlap_scores)):.3f}")
+        overlap_table.add_row("Top-k", str(top_k))
+        console.print()
+        console.print(overlap_table)
 
 
 # Semantic search command
@@ -2063,6 +2287,16 @@ def semantic_search_cli(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
     db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Database path"),
     index_dir: str = typer.Option("data/embeddings", "--index-dir", help="FAISS index directory"),
+    embedding_backend: str = typer.Option(
+        DEFAULT_EMBEDDING_BACKEND,
+        "--embedding-backend",
+        help="Embedding inference backend: torch or onnx",
+    ),
+    onnx_model_dir: Optional[str] = typer.Option(
+        None,
+        "--onnx-model-dir",
+        help="Exported ONNX model directory when using --embedding-backend onnx",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
 ) -> None:
     """
@@ -2081,7 +2315,12 @@ def semantic_search_cli(
     """
     setup_logging(verbose)
 
-    engine = SemanticSearchEngine(db_path, Path(index_dir))
+    engine = SemanticSearchEngine(
+        db_path,
+        Path(index_dir),
+        embedding_backend=embedding_backend,
+        onnx_model_dir=onnx_model_dir,
+    )
 
     console.print("[dim]Loading search indexes...[/dim]")
     try:
@@ -2199,6 +2438,16 @@ def serve_api(
         "--rate-limit",
         help="Max requests per minute per IP (0 to disable)",
     ),
+    embedding_backend: str = typer.Option(
+        DEFAULT_EMBEDDING_BACKEND,
+        "--embedding-backend",
+        help="Embedding inference backend: torch or onnx",
+    ),
+    onnx_model_dir: Optional[str] = typer.Option(
+        None,
+        "--onnx-model-dir",
+        help="Exported ONNX model directory when using --embedding-backend onnx",
+    ),
 ) -> None:
     """
     Start the semantic search API server.
@@ -2234,6 +2483,9 @@ def serve_api(
     console.print(f"  Endpoint:   http://{host}:{port}")
     console.print(f"  API docs:   http://{host}:{port}/docs")
     console.print(f"  CORS:       {', '.join(origins)}")
+    console.print(f"  Embedding:  {embedding_backend}")
+    if onnx_model_dir:
+        console.print(f"  ONNX dir:   {onnx_model_dir}")
     if api_rate_limit > 0:
         console.print(f"  Rate limit: {api_rate_limit} req/min per IP")
     else:
@@ -2249,6 +2501,11 @@ def serve_api(
     os.environ["MCF_INDEX_DIR"] = index_dir
     os.environ["MCF_CORS_ORIGINS"] = cors_origins
     os.environ["MCF_RATE_LIMIT_RPM"] = str(api_rate_limit)
+    os.environ["MCF_EMBEDDING_BACKEND"] = embedding_backend
+    if onnx_model_dir:
+        os.environ["MCF_ONNX_MODEL_DIR"] = onnx_model_dir
+    else:
+        os.environ.pop("MCF_ONNX_MODEL_DIR", None)
 
     uvicorn.run(
         "src.api.app:app",
@@ -2267,6 +2524,16 @@ def run_benchmark(
     embed_texts: int = typer.Option(100, "--embed-texts", help="Number of texts for embedding benchmark"),
     db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Database path"),
     index_dir: str = typer.Option("data/embeddings", "--index-dir", help="FAISS index directory"),
+    embedding_backend: str = typer.Option(
+        DEFAULT_EMBEDDING_BACKEND,
+        "--embedding-backend",
+        help="Embedding inference backend: torch or onnx",
+    ),
+    onnx_model_dir: Optional[str] = typer.Option(
+        None,
+        "--onnx-model-dir",
+        help="Exported ONNX model directory when using --embedding-backend onnx",
+    ),
 ) -> None:
     """
     Run performance benchmarks on the semantic search system.
@@ -2284,22 +2551,26 @@ def run_benchmark(
     """
     import subprocess
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/benchmark.py",
-            "--queries",
-            str(queries),
-            "--warmup",
-            str(warmup),
-            "--embed-texts",
-            str(embed_texts),
-            "--db",
-            db_path,
-            "--index-dir",
-            index_dir,
-        ],
-    )
+    cmd = [
+        sys.executable,
+        "scripts/benchmark.py",
+        "--queries",
+        str(queries),
+        "--warmup",
+        str(warmup),
+        "--embed-texts",
+        str(embed_texts),
+        "--db",
+        db_path,
+        "--index-dir",
+        index_dir,
+        "--embedding-backend",
+        embedding_backend,
+    ]
+    if onnx_model_dir:
+        cmd.extend(["--onnx-model-dir", onnx_model_dir])
+
+    result = subprocess.run(cmd)
     raise typer.Exit(result.returncode)
 
 

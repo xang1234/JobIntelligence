@@ -1,32 +1,39 @@
 """
 Embedding generator for semantic search.
 
-Transforms job text into vector embeddings using Sentence Transformers.
+Transforms job text into vector embeddings using a pluggable inference backend.
 Handles batch processing, skill clustering, and company multi-centroid generation.
 """
+
+from __future__ import annotations
 
 import logging
 import os
 import pickle
 import time
+from datetime import date
 
 # Suppress OpenMP duplicate library warning on macOS.
 # Both PyTorch (via sentence-transformers) and scikit-learn ship libomp,
 # causing threadpoolctl to warn when both are loaded in the same process.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-from collections import defaultdict
-from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from collections import defaultdict  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import TYPE_CHECKING, Callable, Optional  # noqa: E402
 
-import numpy as np
+import numpy as np  # noqa: E402
 
 if TYPE_CHECKING:
-    from sentence_transformers import SentenceTransformer
-
     from ..database import MCFDatabase
     from ..models import Job
 
-from .models import EmbeddingStats, SkillClusterResult
+from .backends import (  # noqa: E402
+    DEFAULT_EMBEDDING_BACKEND,
+    create_embedding_backend,
+    normalize_backend_name,
+    resolve_model_version,
+)
+from .models import EmbeddingStats, SkillClusterResult  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +42,8 @@ class EmbeddingGenerator:
     """
     Generates semantic embeddings for jobs, skills, and companies.
 
-    Uses Sentence Transformers with all-MiniLM-L6-v2 model (384 dimensions).
+    Uses all-MiniLM-L6-v2 embeddings (384 dimensions) via a selectable
+    inference backend.
     Designed for batch processing with progress tracking.
 
     Handles:
@@ -59,6 +67,8 @@ class EmbeddingGenerator:
         self,
         model_name: Optional[str] = None,
         device: Optional[str] = None,
+        backend: str = DEFAULT_EMBEDDING_BACKEND,
+        onnx_model_dir: Optional[str | Path] = None,
     ):
         """
         Initialize generator with lazy model loading.
@@ -66,25 +76,38 @@ class EmbeddingGenerator:
         Args:
             model_name: Override default model (e.g., for testing)
             device: 'cpu', 'cuda', 'mps', or None for auto-detect
+            backend: Embedding inference backend ('torch' or 'onnx')
+            onnx_model_dir: Exported ONNX model directory when backend='onnx'
         """
-        self._model: Optional["SentenceTransformer"] = None
-        self.model_name = model_name or self.MODEL_NAME
+        self._backend = None
+        self.source_model_name = model_name or self.MODEL_NAME
         self.device = device
+        self.backend_name = normalize_backend_name(backend)
+        self.onnx_model_dir = Path(onnx_model_dir) if onnx_model_dir is not None else None
+        self.model_name = resolve_model_version(self.source_model_name, self.backend_name)
 
     @property
-    def model(self) -> "SentenceTransformer":
+    def backend(self):
         """
-        Lazy load the model on first use.
+        Lazy load the configured backend on first use.
 
-        This defers the 2-3 second loading time until embeddings are actually needed.
+        This defers model/session initialization until embeddings are actually needed.
         """
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
+        if self._backend is None:
+            self._backend = create_embedding_backend(
+                backend=self.backend_name,
+                model_name=self.source_model_name,
+                dimension=self.DIMENSION,
+                device=self.device,
+                onnx_model_dir=self.onnx_model_dir,
+            )
+            self.model_name = self._backend.model_version
+        return self._backend
 
-            logger.info(f"Loading embedding model: {self.model_name}")
-            self._model = SentenceTransformer(self.model_name, device=self.device)
-            logger.info(f"Model loaded on device: {self._model.device}")
-        return self._model
+    @property
+    def model(self):
+        """Backwards-compatible alias returning an encode-capable backend."""
+        return self.backend
 
     def _compose_job_text(self, job: "Job") -> str:
         """
@@ -120,8 +143,7 @@ class EmbeddingGenerator:
             Normalized embedding array of shape (DIMENSION,)
         """
         text = self._compose_job_text(job)
-        embedding = self.model.encode(text, normalize_embeddings=True)
-        return np.asarray(embedding, dtype=np.float32)
+        return self.backend.encode_one(text, normalize_embeddings=True)
 
     def generate_job_embeddings_batch(
         self,
@@ -143,7 +165,7 @@ class EmbeddingGenerator:
             Embedding matrix of shape (n_jobs, DIMENSION)
         """
         texts = [self._compose_job_text(job) for job in jobs]
-        embeddings = self.model.encode(
+        embeddings = self.backend.encode_batch(
             texts,
             normalize_embeddings=True,
             batch_size=batch_size,
@@ -161,8 +183,7 @@ class EmbeddingGenerator:
         Returns:
             Normalized embedding array of shape (DIMENSION,)
         """
-        embedding = self.model.encode(skill, normalize_embeddings=True)
-        return np.asarray(embedding, dtype=np.float32)
+        return self.backend.encode_one(skill, normalize_embeddings=True)
 
     def generate_skill_embeddings_batch(
         self,
@@ -182,7 +203,7 @@ class EmbeddingGenerator:
         if not skills:
             return {}
 
-        embeddings = self.model.encode(
+        embeddings = self.backend.encode_batch(
             skills,
             normalize_embeddings=True,
             batch_size=batch_size,
@@ -468,7 +489,7 @@ class EmbeddingGenerator:
         skip_existing: bool = True,
         progress_callback: Optional[Callable[[EmbeddingStats], None]] = None,
         output_dir: Path = Path("data/embeddings"),
-        since: "date | None" = None,
+        since: date | None = None,
     ) -> EmbeddingStats:
         """
         Generate all embeddings: jobs, skills (with clustering), companies.
@@ -617,7 +638,7 @@ class EmbeddingGenerator:
             return
 
         # Generate embeddings
-        embeddings = self.model.encode(
+        embeddings = self.backend.encode_batch(
             texts,
             normalize_embeddings=True,
             batch_size=len(texts),
@@ -667,7 +688,7 @@ class EmbeddingGenerator:
             return
 
         # Generate embeddings
-        embeddings = self.model.encode(
+        embeddings = self.backend.encode_batch(
             texts,
             normalize_embeddings=True,
             batch_size=len(texts),

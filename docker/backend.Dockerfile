@@ -17,7 +17,8 @@ COPY pyproject.toml poetry.lock ./
 # Export pinned requirements (without dev deps, without hashes for compat)
 RUN poetry export -f requirements.txt --without-hashes --without dev --with ml -o requirements.txt
 
-# Install CPU-only PyTorch first (from dedicated wheel index), then everything else.
+# Stage 1 of the ONNX migration keeps the existing CPU-only PyTorch path while
+# also installing ONNX Runtime dependencies for side-by-side comparison.
 # Two-step install avoids pip pulling the CUDA torch variant (~2GB) via the
 # default index when resolving sentence-transformers' torch dependency.
 RUN pip install --no-cache-dir \
@@ -47,6 +48,8 @@ COPY src/ ./src/
 # Environment: paths match the Docker volume mounts in docker-compose.yml
 ENV MCF_DB_PATH=/app/data/mcf_jobs.db \
     MCF_INDEX_DIR=/app/data/embeddings \
+    MCF_EMBEDDING_BACKEND=torch \
+    MCF_ONNX_MODEL_DIR=/app/data/models/all-MiniLM-L6-v2-onnx \
     MCF_CORS_ORIGINS=* \
     MCF_RATE_LIMIT_RPM=100 \
     MCF_SQLITE_JOURNAL_MODE=delete \

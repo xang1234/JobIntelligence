@@ -1,0 +1,130 @@
+"""Tests for embedding backend abstractions."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+from src.api.app import create_app
+from src.mcf.database import MCFDatabase
+from src.mcf.embeddings.backends import (
+    EmbeddingBackend,
+    normalize_backend_name,
+    normalize_vectors,
+    resolve_model_version,
+)
+from src.mcf.embeddings.generator import EmbeddingGenerator
+from src.mcf.embeddings.search_engine import SemanticSearchEngine
+from tests.factories import generate_test_job
+
+
+class DummyEmbeddingBackend(EmbeddingBackend):
+    """Deterministic backend for contract tests."""
+
+    def __init__(self, *, backend_name: str = "torch") -> None:
+        super().__init__("all-MiniLM-L6-v2", backend_name=backend_name, dimension=384)
+        self.calls = 0
+
+    @property
+    def raw_model(self):
+        return self
+
+    def _embed(self, text: str) -> np.ndarray:
+        base = np.zeros(self.dimension, dtype=np.float32)
+        base[0] = len(text)
+        base[1] = sum(ord(char) for char in text) % 97
+        return normalize_vectors(base)
+
+    def encode_one(
+        self,
+        text: str,
+        *,
+        normalize_embeddings: bool = True,
+    ) -> np.ndarray:
+        self.calls += 1
+        embedding = self._embed(text)
+        if normalize_embeddings:
+            return embedding.astype(np.float32)
+        return (embedding * 3.0).astype(np.float32)
+
+    def encode_batch(
+        self,
+        texts,
+        *,
+        batch_size: int = 32,
+        normalize_embeddings: bool = True,
+        show_progress_bar: bool = False,
+    ) -> np.ndarray:
+        del batch_size, show_progress_bar
+        return np.vstack(
+            [
+                self.encode_one(text, normalize_embeddings=normalize_embeddings)
+                for text in texts
+            ]
+        ).astype(np.float32)
+
+
+def test_model_version_suffix_for_onnx():
+    assert resolve_model_version("all-MiniLM-L6-v2", "torch") == "all-MiniLM-L6-v2"
+    assert resolve_model_version("all-MiniLM-L6-v2", "onnx") == "all-MiniLM-L6-v2+onnx"
+
+
+def test_backend_name_validation():
+    assert normalize_backend_name("Torch") == "torch"
+    assert normalize_backend_name("onnx") == "onnx"
+
+
+def test_generator_uses_backend_contract():
+    generator = EmbeddingGenerator()
+    backend = DummyEmbeddingBackend()
+    generator._backend = backend
+
+    job = generate_test_job(title="Data Scientist", skills=["Python", "SQL"])
+    embedding = generator.generate_job_embedding(job)
+    batch = generator.generate_skill_embeddings_batch(["Python", "SQL"])
+
+    assert embedding.shape == (384,)
+    assert embedding.dtype == np.float32
+    assert np.isclose(np.linalg.norm(embedding), 1.0)
+    assert set(batch.keys()) == {"Python", "SQL"}
+    assert all(value.shape == (384,) for value in batch.values())
+    assert generator.model.encode("backend alias").shape == (384,)
+
+
+def test_search_engine_query_embedding_uses_backend_cache(temp_dir: Path):
+    db = MCFDatabase(str(temp_dir / "query-cache.db"))
+    db.upsert_job(generate_test_job())
+
+    engine = SemanticSearchEngine(
+        db_path=str(db.db_path),
+        index_dir=temp_dir / "embeddings",
+    )
+    backend = DummyEmbeddingBackend()
+    engine.generator._backend = backend
+
+    first = engine._get_query_embedding("python developer")
+    second = engine._get_query_embedding("python developer")
+
+    assert first.shape == (384,)
+    assert np.array_equal(first, second)
+    assert backend.calls == 1
+
+
+def test_onnx_generator_uses_distinct_model_version():
+    generator = EmbeddingGenerator(
+        backend="onnx",
+        onnx_model_dir="data/embeddings",
+    )
+    assert generator.model_name == "all-MiniLM-L6-v2+onnx"
+    assert generator.backend_name == "onnx"
+
+
+def test_create_app_reads_embedding_backend_env(monkeypatch):
+    monkeypatch.setenv("MCF_EMBEDDING_BACKEND", "onnx")
+    monkeypatch.setenv("MCF_ONNX_MODEL_DIR", "/tmp/mcf-onnx")
+
+    app = create_app()
+
+    assert app.state.embedding_backend == "onnx"
+    assert app.state.onnx_model_dir == "/tmp/mcf-onnx"

@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from src.mcf.database import MCFDatabase
+from src.mcf.embeddings.backends import resolve_model_version
 from src.mcf.models import Job
 
 from .factories import (
@@ -198,6 +199,62 @@ def mock_embedding() -> np.ndarray:
     embedding = np.random.randn(384).astype(np.float32)
     embedding = embedding / np.linalg.norm(embedding)  # Normalize
     return embedding
+
+
+class _TestEmbeddingBackend:
+    """Deterministic backend stub used across tests to avoid model imports."""
+
+    def __init__(self, model_name: str, backend: str, dimension: int) -> None:
+        self.backend_name = backend
+        self.dimension = dimension
+        self.model_version = resolve_model_version(model_name, backend)
+        self.device = "test"
+
+    def _vector_for_text(self, text: str) -> np.ndarray:
+        vector = np.zeros(self.dimension, dtype=np.float32)
+        vector[0] = len(text)
+        vector[1] = sum(ord(char) for char in text) % 101
+        norm = np.linalg.norm(vector)
+        return vector if norm == 0 else vector / norm
+
+    def encode_one(self, text: str, *, normalize_embeddings: bool = True) -> np.ndarray:
+        vector = self._vector_for_text(text)
+        if normalize_embeddings:
+            return vector.astype(np.float32)
+        return (vector * 7.0).astype(np.float32)
+
+    def encode_batch(
+        self,
+        texts,
+        *,
+        batch_size: int = 32,
+        normalize_embeddings: bool = True,
+        show_progress_bar: bool = False,
+    ) -> np.ndarray:
+        del batch_size, show_progress_bar
+        return np.vstack(
+            [
+                self.encode_one(text, normalize_embeddings=normalize_embeddings)
+                for text in texts
+            ]
+        ).astype(np.float32)
+
+    def encode(self, sentences, **kwargs):
+        if isinstance(sentences, str):
+            return self.encode_one(sentences, **kwargs)
+        return self.encode_batch(sentences, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def stub_embedding_backend(monkeypatch):
+    """Replace runtime backend creation with a deterministic test double."""
+    import src.mcf.embeddings.generator as generator_module
+
+    def _factory(*, backend: str, model_name: str, dimension: int, device=None, onnx_model_dir=None):
+        del device, onnx_model_dir
+        return _TestEmbeddingBackend(model_name=model_name, backend=backend, dimension=dimension)
+
+    monkeypatch.setattr(generator_module, "create_embedding_backend", _factory)
 
 
 @pytest.fixture

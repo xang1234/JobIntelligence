@@ -34,6 +34,7 @@ import numpy as np
 from cachetools import TTLCache
 
 from ..database import MCFDatabase
+from .backends import DEFAULT_EMBEDDING_BACKEND, resolve_model_version
 from .generator import EmbeddingGenerator
 from .index_manager import (
     FAISSIndexManager,
@@ -92,6 +93,8 @@ class SemanticSearchEngine:
         db_path: str = "data/mcf_jobs.db",
         index_dir: Path = Path("data/embeddings"),
         model_version: str = "all-MiniLM-L6-v2",
+        embedding_backend: str = DEFAULT_EMBEDDING_BACKEND,
+        onnx_model_dir: str | Path | None = None,
     ):
         """
         Initialize the search engine.
@@ -100,17 +103,25 @@ class SemanticSearchEngine:
             db_path: Path to SQLite database
             index_dir: Directory containing FAISS indexes
             model_version: Embedding model version for compatibility
+            embedding_backend: Embedding inference backend for query encoding
+            onnx_model_dir: Exported ONNX model directory when backend='onnx'
         """
         self.db = MCFDatabase(db_path, ensure_schema=False)
         self.index_dir = Path(index_dir)
-        self.model_version = model_version
+        self.embedding_backend = embedding_backend
+        self.onnx_model_dir = Path(onnx_model_dir) if onnx_model_dir is not None else None
+        self.model_version = resolve_model_version(model_version, embedding_backend)
 
         # Components (loaded lazily)
         self.index_manager = FAISSIndexManager(
             index_dir=self.index_dir,
-            model_version=model_version,
+            model_version=self.model_version,
         )
-        self.generator = EmbeddingGenerator(model_name=model_version)
+        self.generator = EmbeddingGenerator(
+            model_name=model_version,
+            backend=embedding_backend,
+            onnx_model_dir=self.onnx_model_dir,
+        )
         self.query_expander: Optional[QueryExpander] = None
 
         # Caches
@@ -807,6 +818,7 @@ class SemanticSearchEngine:
             "has_vector_index": self._has_vector_index,
             "has_skill_clusters": self._has_skill_clusters,
             "model_version": self.model_version,
+            "embedding_backend": self.embedding_backend,
             "index_dir": str(self.index_dir),
         }
 
@@ -893,11 +905,10 @@ class SemanticSearchEngine:
             return cached
 
         # Generate embedding
-        embedding = self.generator.model.encode(
+        embedding = self.generator.backend.encode_one(
             query,
             normalize_embeddings=True,
         )
-        embedding = np.asarray(embedding, dtype=np.float32)
 
         # Cache it
         self._query_cache[cache_key] = embedding
