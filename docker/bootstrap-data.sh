@@ -39,13 +39,15 @@ if $PROD; then
         mkdir -p /opt/mcf/data/embeddings
         cp -r data/embeddings/* /opt/mcf/data/embeddings/
     fi
+
+    echo "Rebuilding and starting backend with the bundled ONNX model..."
+    $COMPOSE_CMD up -d --build backend
 else
-    # Named volumes: use docker cp into the running container
-    if ! docker ps --format '{{.Names}}' | grep -q '^mcf-backend$'; then
-        echo "Starting backend container..."
-        $COMPOSE_CMD up -d backend
-        sleep 5
-    fi
+    # Named volumes: rebuild the image first so the running container picks up
+    # the bundled ONNX model before data is copied in.
+    echo "Rebuilding and starting backend with the bundled ONNX model..."
+    $COMPOSE_CMD up -d --build backend
+    sleep 5
 
     echo "Copying database into container..."
     docker cp data/mcf_jobs.db mcf-backend:/app/data/
@@ -54,12 +56,11 @@ else
         echo "Copying embeddings into container..."
         docker cp data/embeddings/ mcf-backend:/app/data/
     fi
+    echo "Restarting backend to reload FAISS indexes..."
+    $COMPOSE_CMD restart backend
 fi
 
-# ── Restart and verify ────────────────────────────────────────────────────────
-
-echo "Restarting backend to reload FAISS indexes..."
-$COMPOSE_CMD restart backend
+# ── Verify ────────────────────────────────────────────────────────────────────
 
 echo "Waiting for health check (up to 90s)..."
 for i in $(seq 1 18); do
