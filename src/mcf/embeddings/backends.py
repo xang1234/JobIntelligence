@@ -50,6 +50,12 @@ def resolve_model_version(model_name: str, backend: str) -> str:
     return base_model
 
 
+def default_onnx_model_dir(model_name: str) -> Path:
+    """Return the standard local export directory for an ONNX model bundle."""
+    safe_name = resolve_base_model_name(model_name, "onnx").replace("/", "--")
+    return Path("data/models") / f"{safe_name}-onnx"
+
+
 def normalize_vectors(vectors: np.ndarray) -> np.ndarray:
     """L2-normalize one or more vectors without changing shape."""
     array = np.asarray(vectors, dtype=np.float32)

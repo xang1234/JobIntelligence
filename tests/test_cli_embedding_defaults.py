@@ -1,0 +1,90 @@
+"""CLI tests for ONNX default backend wiring."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+from typer.testing import CliRunner
+
+import src.cli as cli
+
+runner = CliRunner()
+
+
+def test_create_embedding_generator_defaults_to_onnx_dir(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_validate(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(cli, "validate_embedding_backend_config", fake_validate)
+
+    generator = cli._create_embedding_generator()
+
+    assert generator.backend_name == "onnx"
+    assert generator.onnx_model_dir == Path("data/models/all-MiniLM-L6-v2-onnx")
+    assert captured["backend"] == "onnx"
+    assert captured["onnx_model_dir"] == Path("data/models/all-MiniLM-L6-v2-onnx")
+
+
+def test_api_serve_defaults_to_onnx(monkeypatch, temp_dir: Path):
+    db_path = temp_dir / "smoke.db"
+    db_path.touch()
+    index_dir = temp_dir / "embeddings"
+    index_dir.mkdir()
+    (index_dir / "jobs.index").touch()
+    calls: dict[str, object] = {}
+    previous_backend = os.environ.get("MCF_EMBEDDING_BACKEND")
+    previous_model_dir = os.environ.get("MCF_ONNX_MODEL_DIR")
+
+    import uvicorn
+
+    def fake_run(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+
+    try:
+        result = runner.invoke(
+            cli.app,
+            ["api-serve", "--db", str(db_path), "--index-dir", str(index_dir)],
+        )
+
+        assert result.exit_code == 0
+        assert calls["args"] == ("src.api.app:app",)
+        assert os.environ["MCF_EMBEDDING_BACKEND"] == "onnx"
+        assert os.environ["MCF_ONNX_MODEL_DIR"] == "data/models/all-MiniLM-L6-v2-onnx"
+    finally:
+        if previous_backend is None:
+            os.environ.pop("MCF_EMBEDDING_BACKEND", None)
+        else:
+            os.environ["MCF_EMBEDDING_BACKEND"] = previous_backend
+        if previous_model_dir is None:
+            os.environ.pop("MCF_ONNX_MODEL_DIR", None)
+        else:
+            os.environ["MCF_ONNX_MODEL_DIR"] = previous_model_dir
+
+
+def test_benchmark_defaults_to_onnx(monkeypatch):
+    calls: dict[str, object] = {}
+
+    def fake_run(cmd, *args, **kwargs):
+        calls["cmd"] = cmd
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = runner.invoke(cli.app, ["benchmark", "--queries", "1", "--warmup", "0"])
+
+    assert result.exit_code == 0
+    assert calls["cmd"][-4:] == [
+        "--embedding-backend",
+        "onnx",
+        "--onnx-model-dir",
+        "data/models/all-MiniLM-L6-v2-onnx",
+    ]

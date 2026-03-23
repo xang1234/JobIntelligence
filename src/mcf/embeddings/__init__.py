@@ -39,6 +39,7 @@ from .backends import (
     OnnxEmbeddingBackend,
     TorchSentenceTransformerBackend,
     create_embedding_backend,
+    default_onnx_model_dir,
     export_sentence_transformer_to_onnx,
     validate_embedding_backend_config,
 )
@@ -73,6 +74,7 @@ __all__ = [
     "OnnxEmbeddingBackend",
     "DEFAULT_EMBEDDING_BACKEND",
     "create_embedding_backend",
+    "default_onnx_model_dir",
     "export_sentence_transformer_to_onnx",
     "validate_embedding_backend_config",
     # Index management

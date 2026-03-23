@@ -52,8 +52,8 @@ jobs:
             --ignore=tests/test_market_intelligence.py \
             -x -q
 
-  backend-heavy:
-    name: Backend (ML)
+  backend-runtime:
+    name: Backend (ONNX runtime)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,24 +69,52 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pypoetry
-          key: poetry-heavy-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
-          restore-keys: poetry-heavy-${{ runner.os }}-
+          key: poetry-runtime-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+          restore-keys: poetry-runtime-${{ runner.os }}-
 
-      - name: Install CPU-only PyTorch
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install ONNX/runtime dependencies
+        run: poetry install --with ml
 
-      - name: Install dependencies (all including ML backends)
-        run: poetry install --with ml,ml_torch
-
-      - name: Run ML tests
+      - name: Run runtime tests
         run: |
           poetry run pytest \
+            tests/test_benchmark_script.py \
+            tests/test_cli_embedding_defaults.py \
             tests/test_index_manager.py \
             tests/test_search_engine.py \
             tests/test_query_expander.py \
             tests/test_company_centroids.py \
             tests/test_market_intelligence.py \
             -x -q
+
+  docker-onnx-smoke:
+    name: Docker (ONNX smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - name: Cache Poetry venv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-docker-smoke-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+          restore-keys: poetry-docker-smoke-${{ runner.os }}-
+
+      - name: Install CPU-only PyTorch for ONNX export
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies for export + runtime
+        run: poetry install --with ml,ml_torch
+
+      - name: Run Docker ONNX smoke test
+        run: bash scripts/run_docker_onnx_smoke.sh
 
   frontend:
     name: Frontend

@@ -23,7 +23,7 @@ from rich.table import Table
 # Add project root to path so we can import src.*
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.mcf.embeddings import FAISSIndexManager, SemanticSearchEngine
+from src.mcf.embeddings import FAISSIndexManager, SemanticSearchEngine, default_onnx_model_dir
 from src.mcf.embeddings.generator import EmbeddingGenerator
 from src.mcf.embeddings.models import SearchRequest
 
@@ -331,7 +331,7 @@ def main() -> int:
     parser.add_argument(
         "--embedding-backend",
         type=str,
-        default="torch",
+        default="onnx",
         help="Embedding inference backend: torch or onnx",
     )
     parser.add_argument(
@@ -341,6 +341,8 @@ def main() -> int:
         help="Exported ONNX model directory when using --embedding-backend onnx",
     )
     args = parser.parse_args()
+    if args.embedding_backend.strip().lower() == "onnx" and args.onnx_model_dir is None:
+        args.onnx_model_dir = str(default_onnx_model_dir(EmbeddingGenerator.MODEL_NAME))
 
     console.print("[bold]MCF Semantic Search Benchmark[/bold]")
     console.print(f"[dim]Embedding backend: {args.embedding_backend}[/dim]")

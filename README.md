@@ -45,6 +45,8 @@ Scrapes the full MCF job archive (2019–present, ~6M listings), builds hybrid B
 ```bash
 poetry install --with ml,ml_torch
 poetry run python -m src.cli scrape "data scientist"
+# Export the default ONNX bundle once for local CLI and Docker usage.
+poetry run python -m src.cli embed-export-onnx all-MiniLM-L6-v2 --output-dir data/models/all-MiniLM-L6-v2-onnx
 poetry run python -m src.cli embed-generate
 poetry run python -m src.cli api-serve --reload    # Swagger UI at localhost:8000/docs
 cd src/frontend && npm install && npm run dev       # Frontend at localhost:5173
@@ -52,9 +54,8 @@ cd src/frontend && npm install && npm run dev       # Frontend at localhost:5173
 # Or run everything with Docker
 # Export the ONNX bundle once so the backend container can mount it from data/models/
 poetry run python -m src.cli embed-export-onnx all-MiniLM-L6-v2 --output-dir data/models/all-MiniLM-L6-v2-onnx
-# Build ONNX embeddings/indexes for the Docker runtime.
-# Use --no-skip-existing if you already generated torch embeddings above.
-poetry run python -m src.cli embed-generate --embedding-backend onnx --onnx-model-dir data/models/all-MiniLM-L6-v2-onnx --no-skip-existing
+# Rebuild embeddings/indexes for the ONNX runtime.
+poetry run python -m src.cli embed-generate --no-skip-existing
 docker compose up
 ```
 

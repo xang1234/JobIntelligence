@@ -42,12 +42,12 @@ from src.mcf import (
     ScraperDaemon,
 )
 from src.mcf.embeddings import (
-    DEFAULT_EMBEDDING_BACKEND,
     FAISSIndexManager,
     IndexCompatibilityError,
     SearchRequest,
     SearchResponse,
     SemanticSearchEngine,
+    default_onnx_model_dir,
     export_sentence_transformer_to_onnx,
     validate_embedding_backend_config,
 )
@@ -58,33 +58,52 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+CLI_DEFAULT_EMBEDDING_BACKEND = "onnx"
 
 
 def _default_onnx_model_dir(model_name: str) -> Path:
     """Return the default export directory for an ONNX embedding model."""
-    safe_name = model_name.replace("/", "--")
-    return Path("data/models") / f"{safe_name}-onnx"
+    return default_onnx_model_dir(model_name)
+
+
+def _resolve_cli_onnx_model_dir(
+    *,
+    backend: str,
+    model_name: str | None = None,
+    onnx_model_dir: str | Path | None = None,
+) -> str | Path | None:
+    """Resolve the effective ONNX model directory for CLI commands."""
+    if onnx_model_dir is not None:
+        return onnx_model_dir
+    if backend.strip().lower() != "onnx":
+        return None
+    return _default_onnx_model_dir(model_name or EmbeddingGenerator.MODEL_NAME)
 
 
 def _create_embedding_generator(
     *,
     model_name: str | None = None,
-    backend: str = DEFAULT_EMBEDDING_BACKEND,
+    backend: str = CLI_DEFAULT_EMBEDDING_BACKEND,
     device: str | None = None,
     onnx_model_dir: str | Path | None = None,
 ) -> EmbeddingGenerator:
     """Create an embedding generator with the selected backend settings."""
+    resolved_onnx_model_dir = _resolve_cli_onnx_model_dir(
+        backend=backend,
+        model_name=model_name,
+        onnx_model_dir=onnx_model_dir,
+    )
     validate_embedding_backend_config(
         backend=backend,
         model_name=model_name or EmbeddingGenerator.MODEL_NAME,
         dimension=EmbeddingGenerator.DIMENSION,
-        onnx_model_dir=onnx_model_dir,
+        onnx_model_dir=resolved_onnx_model_dir,
     )
     return EmbeddingGenerator(
         model_name=model_name,
         device=device,
         backend=backend,
-        onnx_model_dir=onnx_model_dir,
+        onnx_model_dir=resolved_onnx_model_dir,
     )
 
 
@@ -1480,7 +1499,7 @@ def generate_embeddings(
         None, "--since", help="Only embed jobs posted on or after this date (YYYY-MM-DD)"
     ),
     embedding_backend: str = typer.Option(
-        DEFAULT_EMBEDDING_BACKEND,
+        CLI_DEFAULT_EMBEDDING_BACKEND,
         "--embedding-backend",
         help="Embedding inference backend: torch or onnx",
     ),
@@ -1727,7 +1746,7 @@ def sync_embeddings(
         None, "--since", help="Only sync jobs posted on or after this date (YYYY-MM-DD)"
     ),
     embedding_backend: str = typer.Option(
-        DEFAULT_EMBEDDING_BACKEND,
+        CLI_DEFAULT_EMBEDDING_BACKEND,
         "--embedding-backend",
         help="Embedding inference backend: torch or onnx",
     ),
@@ -1998,7 +2017,7 @@ def upgrade_embeddings(
     batch_size: int = typer.Option(32, "--batch-size", "-b", help="Jobs to process in each batch"),
     db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Path to SQLite database"),
     embedding_backend: str = typer.Option(
-        DEFAULT_EMBEDDING_BACKEND,
+        CLI_DEFAULT_EMBEDDING_BACKEND,
         "--embedding-backend",
         help="Embedding inference backend: torch or onnx",
     ),
@@ -2295,7 +2314,7 @@ def semantic_search_cli(
     db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Database path"),
     index_dir: str = typer.Option("data/embeddings", "--index-dir", help="FAISS index directory"),
     embedding_backend: str = typer.Option(
-        DEFAULT_EMBEDDING_BACKEND,
+        CLI_DEFAULT_EMBEDDING_BACKEND,
         "--embedding-backend",
         help="Embedding inference backend: torch or onnx",
     ),
@@ -2321,6 +2340,10 @@ def semantic_search_cli(
         mcf search-semantic "AI engineer" --json
     """
     setup_logging(verbose)
+    onnx_model_dir = _resolve_cli_onnx_model_dir(
+        backend=embedding_backend,
+        onnx_model_dir=onnx_model_dir,
+    )
 
     engine = SemanticSearchEngine(
         db_path,
@@ -2446,7 +2469,7 @@ def serve_api(
         help="Max requests per minute per IP (0 to disable)",
     ),
     embedding_backend: str = typer.Option(
-        DEFAULT_EMBEDDING_BACKEND,
+        CLI_DEFAULT_EMBEDDING_BACKEND,
         "--embedding-backend",
         help="Embedding inference backend: torch or onnx",
     ),
@@ -2468,6 +2491,11 @@ def serve_api(
     import os
 
     import uvicorn
+
+    onnx_model_dir = _resolve_cli_onnx_model_dir(
+        backend=embedding_backend,
+        onnx_model_dir=onnx_model_dir,
+    )
 
     origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
 
@@ -2510,7 +2538,7 @@ def serve_api(
     os.environ["MCF_RATE_LIMIT_RPM"] = str(api_rate_limit)
     os.environ["MCF_EMBEDDING_BACKEND"] = embedding_backend
     if onnx_model_dir:
-        os.environ["MCF_ONNX_MODEL_DIR"] = onnx_model_dir
+        os.environ["MCF_ONNX_MODEL_DIR"] = str(onnx_model_dir)
     else:
         os.environ.pop("MCF_ONNX_MODEL_DIR", None)
 
@@ -2532,7 +2560,7 @@ def run_benchmark(
     db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Database path"),
     index_dir: str = typer.Option("data/embeddings", "--index-dir", help="FAISS index directory"),
     embedding_backend: str = typer.Option(
-        DEFAULT_EMBEDDING_BACKEND,
+        CLI_DEFAULT_EMBEDDING_BACKEND,
         "--embedding-backend",
         help="Embedding inference backend: torch or onnx",
     ),
@@ -2558,6 +2586,11 @@ def run_benchmark(
     """
     import subprocess
 
+    onnx_model_dir = _resolve_cli_onnx_model_dir(
+        backend=embedding_backend,
+        onnx_model_dir=onnx_model_dir,
+    )
+
     cmd = [
         sys.executable,
         "scripts/benchmark.py",
@@ -2575,7 +2608,7 @@ def run_benchmark(
         embedding_backend,
     ]
     if onnx_model_dir:
-        cmd.extend(["--onnx-model-dir", onnx_model_dir])
+        cmd.extend(["--onnx-model-dir", str(onnx_model_dir)])
 
     result = subprocess.run(cmd)
     raise typer.Exit(result.returncode)
