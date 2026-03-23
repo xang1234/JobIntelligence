@@ -17,13 +17,10 @@ COPY pyproject.toml poetry.lock ./
 # Export pinned requirements (without dev deps, without hashes for compat)
 RUN poetry export -f requirements.txt --without-hashes --without dev --with ml -o requirements.txt
 
-# Stage 1 of the ONNX migration keeps the existing CPU-only PyTorch path while
-# also installing ONNX Runtime dependencies for side-by-side comparison.
-# Two-step install avoids pip pulling the CUDA torch variant (~2GB) via the
-# default index when resolving sentence-transformers' torch dependency.
-RUN pip install --no-cache-dir \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
-        -r requirements.txt
+# Phase 2 production image installs only ONNX inference/runtime dependencies.
+# Torch and sentence-transformers move to the optional ml_torch group for
+# export/dev workflows outside the production container.
+RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 # Clean slim image with only the installed packages + application source.
@@ -48,7 +45,8 @@ COPY src/ ./src/
 # Environment: paths match the Docker volume mounts in docker-compose.yml
 ENV MCF_DB_PATH=/app/data/mcf_jobs.db \
     MCF_INDEX_DIR=/app/data/embeddings \
-    MCF_EMBEDDING_BACKEND=torch \
+    MCF_EMBEDDING_BACKEND=onnx \
+    MCF_ONNX_MODEL_DIR=/app/data/models/all-MiniLM-L6-v2-onnx \
     MCF_CORS_ORIGINS=* \
     MCF_RATE_LIMIT_RPM=100 \
     MCF_SQLITE_JOURNAL_MODE=delete \
@@ -57,7 +55,7 @@ ENV MCF_DB_PATH=/app/data/mcf_jobs.db \
 EXPOSE 8000
 
 # start-period=60s: FAISS index loading takes 5-30s on startup; the
-# sentence-transformers model lazy-loads on first search (~10-15s).
+# ONNX session/tokenizer still initialize lazily on first search.
 # Failures during start-period don't count toward retries.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1

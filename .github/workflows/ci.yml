@@ -75,8 +75,8 @@ jobs:
       - name: Install CPU-only PyTorch
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Install dependencies (all including ML)
-        run: poetry install --with ml
+      - name: Install dependencies (all including ML backends)
+        run: poetry install --with ml,ml_torch
 
       - name: Run ML tests
         run: |

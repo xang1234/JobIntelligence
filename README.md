@@ -36,20 +36,22 @@ Scrapes the full MCF job archive (2019–present, ~6M listings), builds hybrid B
 | Layer | Technologies |
 |-------|-------------|
 | **Backend** | Python · FastAPI · SQLite · httpx · Pydantic · Typer |
-| **Search** | sentence-transformers · FAISS · BM25 (FTS5) · scikit-learn |
+| **Search** | ONNX Runtime · transformers · FAISS · BM25 (FTS5) · scikit-learn |
 | **Frontend** | React · Vite · TypeScript · Recharts · Tailwind CSS |
 | **Infrastructure** | Docker Compose · nginx · uvicorn · Poetry |
 
 ## Quick start
 
 ```bash
-poetry install
+poetry install --with ml,ml_torch
 poetry run python -m src.cli scrape "data scientist"
 poetry run python -m src.cli embed-generate
 poetry run python -m src.cli api-serve --reload    # Swagger UI at localhost:8000/docs
 cd src/frontend && npm install && npm run dev       # Frontend at localhost:5173
 
 # Or run everything with Docker
+# Export the ONNX bundle once so the backend container can mount it from data/models/
+poetry run python -m src.cli embed-export-onnx all-MiniLM-L6-v2 --output-dir data/models/all-MiniLM-L6-v2-onnx
 docker compose up
 ```
 
@@ -80,7 +82,7 @@ The REST API serves hybrid search, profile matching, market trends, and company 
 ## Development
 
 ```bash
-poetry install
+poetry install --with ml,ml_torch
 poetry run pytest
 python -m src.cli scrape "test" -v
 ```

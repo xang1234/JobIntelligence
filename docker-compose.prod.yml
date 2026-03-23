@@ -39,7 +39,8 @@ services:
         max-size: "10m"
         max-file: "5"
 
-# Host directories must exist: mkdir -p /opt/mcf/data/embeddings /opt/mcf/hf-cache
+# Host directories must exist:
+#   mkdir -p /opt/mcf/data/embeddings /opt/mcf/data/models/all-MiniLM-L6-v2-onnx /opt/mcf/hf-cache
 volumes:
   hf-cache:
     driver: local

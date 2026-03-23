@@ -139,9 +139,9 @@ def benchmark_embedding(generator: EmbeddingGenerator, n_texts: int) -> dict:
     }
 
 
-def benchmark_index_load(index_dir: Path) -> dict:
+def benchmark_index_load(index_dir: Path, *, model_version: str = "all-MiniLM-L6-v2") -> dict:
     """Benchmark FAISS index load time from disk."""
-    manager = FAISSIndexManager(index_dir)
+    manager = FAISSIndexManager(index_dir, model_version=model_version)
 
     if not manager.exists():
         return {"error": f"No indexes found at {index_dir}"}
@@ -367,7 +367,7 @@ def main() -> int:
     # --- Run benchmarks ---
     search_results = benchmark_search(engine, args.queries, args.warmup)
     embedding_results = benchmark_embedding(engine.generator, args.embed_texts)
-    index_results = benchmark_index_load(index_dir)
+    index_results = benchmark_index_load(index_dir, model_version=engine.model_version)
 
     # --- Print results ---
     all_passed = print_results(search_results, embedding_results, index_results)

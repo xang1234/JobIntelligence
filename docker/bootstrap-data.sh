@@ -39,6 +39,12 @@ if $PROD; then
         mkdir -p /opt/mcf/data/embeddings
         cp -r data/embeddings/* /opt/mcf/data/embeddings/
     fi
+
+    if [ -d data/models ]; then
+        echo "Copying ONNX models to /opt/mcf/data/models/ ..."
+        mkdir -p /opt/mcf/data/models
+        cp -r data/models/* /opt/mcf/data/models/
+    fi
 else
     # Named volumes: use docker cp into the running container
     if ! docker ps --format '{{.Names}}' | grep -q '^mcf-backend$'; then
@@ -53,6 +59,11 @@ else
     if [ -d data/embeddings ]; then
         echo "Copying embeddings into container..."
         docker cp data/embeddings/ mcf-backend:/app/data/
+    fi
+
+    if [ -d data/models ]; then
+        echo "Copying ONNX models into container..."
+        docker cp data/models/ mcf-backend:/app/data/
     fi
 fi
 
