@@ -132,6 +132,16 @@ def test_create_app_reads_embedding_backend_env(monkeypatch):
     assert app.state.onnx_model_dir == "/tmp/mcf-onnx"
 
 
+def test_create_app_prefers_database_url_env(monkeypatch):
+    monkeypatch.delenv("MCF_DB_PATH", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/mcf")
+    monkeypatch.setattr("src.api.app.validate_embedding_backend_config", lambda **kwargs: None)
+
+    app = create_app()
+
+    assert app.state.db_path == "postgresql://postgres:postgres@localhost:5432/mcf"
+
+
 def test_create_app_fails_fast_for_missing_onnx_model_dir():
     with pytest.raises(FileNotFoundError):
         create_app(embedding_backend="onnx", onnx_model_dir="/tmp/does-not-exist")

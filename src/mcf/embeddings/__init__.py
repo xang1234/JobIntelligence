@@ -3,7 +3,7 @@ Embedding generation, indexing, and semantic search module.
 
 Provides:
 - Vector embeddings for jobs, skills, and companies (Sentence Transformers)
-- FAISS index management for efficient similarity search
+- FAISS and pgvector backends for efficient similarity search
 - SemanticSearchEngine for hybrid semantic + keyword search
 
 Features:
@@ -11,7 +11,7 @@ Features:
 - Batch processing with progress tracking
 - Skill clustering for query expansion
 - Company multi-centroid embeddings
-- FAISS index management (IVFFlat for jobs, Flat for skills/companies)
+- FAISS index management for local search and pgvector support for Postgres
 - Hybrid scoring combining semantic and BM25 keyword search
 - Result caching and graceful degradation
 
@@ -43,6 +43,7 @@ from .backends import (
     export_sentence_transformer_to_onnx,
     validate_embedding_backend_config,
 )
+from .faiss_backend import FAISSVectorBackend
 from .generator import EmbeddingGenerator
 from .index_manager import (
     FAISSIndexManager,
@@ -61,8 +62,10 @@ from .models import (
     SkillClusterResult,
     SkillSearchRequest,
 )
+from .pgvector_backend import PGVectorBackend
 from .query_expander import QueryExpander
 from .search_engine import SemanticSearchEngine
+from .vector_backend import VectorBackend
 
 __all__ = [
     # Generator
@@ -77,6 +80,9 @@ __all__ = [
     "default_onnx_model_dir",
     "export_sentence_transformer_to_onnx",
     "validate_embedding_backend_config",
+    "VectorBackend",
+    "FAISSVectorBackend",
+    "PGVectorBackend",
     # Index management
     "FAISSIndexManager",
     "IndexNotBuiltError",

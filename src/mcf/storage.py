@@ -16,7 +16,7 @@ from typing import Optional
 
 import pandas as pd
 
-from .database import MCFDatabase
+from .db_factory import open_database
 from .models import Checkpoint, Job
 
 logger = logging.getLogger(__name__)
@@ -316,7 +316,7 @@ class SQLiteStorage:
             db_path: Path to SQLite database file
             output_dir: Directory for CSV/JSON exports
         """
-        self.db = MCFDatabase(db_path)
+        self.db = open_database(db_path)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 

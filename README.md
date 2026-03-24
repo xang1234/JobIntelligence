@@ -35,8 +35,8 @@ Scrapes the full MCF job archive (2019–present, ~6M listings), builds hybrid B
 
 | Layer | Technologies |
 |-------|-------------|
-| **Backend** | Python · FastAPI · SQLite · httpx · Pydantic · Typer |
-| **Search** | ONNX Runtime · transformers · FAISS · BM25 (FTS5) · scikit-learn |
+| **Backend** | Python · FastAPI · SQLite/PostgreSQL · httpx · Pydantic · Typer |
+| **Search** | ONNX Runtime · transformers · FAISS · pgvector · BM25/FTS · scikit-learn |
 | **Frontend** | React · Vite · TypeScript · Recharts · Tailwind CSS |
 | **Infrastructure** | Docker Compose · nginx · uvicorn · Poetry |
 
@@ -62,6 +62,33 @@ docker compose up
 The first Docker backend build is slower because it downloads and exports the bundled ONNX model once. After that, Docker deployments no longer depend on a host-side `data/models/...` bundle.
 
 > **Tip:** `alias mcf="poetry run python -m src.cli"` — then `mcf scrape`, `mcf search`, etc.
+
+## PostgreSQL rollout
+
+Local development can now target either a SQLite path or a PostgreSQL DSN via `--db`, `MCF_DB_PATH`, or `DATABASE_URL`.
+
+```bash
+# 1. Create and verify a hot backup before touching the live SQLite file.
+poetry run python -m src.cli db-backup --source data/mcf_jobs.db --backup-dir data/backups
+
+# 2. Load a verified SQLite backup into local Postgres.
+poetry run python -m src.cli pg-migrate \
+  --source data/backups/mcf_pre_postgres_20260324T191812.db \
+  --target postgresql://postgres:postgres@localhost:5432/mcf
+
+# 3. Serve locally from Postgres with pgvector.
+poetry run python -m src.cli api-serve \
+  --db postgresql://postgres:postgres@localhost:5432/mcf \
+  --search-backend pgvector
+
+# 4. Seed and maintain a lean hosted slice (2026 + last 90 days, job vectors only).
+poetry run python -m src.cli pg-seed-hosted \
+  --source postgresql://postgres:postgres@localhost:5432/mcf \
+  --target postgresql://<neon-dsn>
+poetry run python -m src.cli pg-purge-hosted --target postgresql://<neon-dsn>
+```
+
+The hosted slice intentionally excludes skill and company embeddings. Local Postgres keeps the full archive, while FAISS remains available for local/offline search during the transition.
 
 ## Architecture
 

@@ -45,6 +45,10 @@ data/*.log
 data/.scraper.pid
 data/scrape_jsons/*json
 data/embeddings/
+data/backups/*.db
+data/backups/*.db-shm
+data/backups/*.db-wal
+!data/backups/*.metadata.json
 
 # Pickle / binary artifacts
 *.pkl

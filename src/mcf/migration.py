@@ -20,7 +20,7 @@ from typing import Optional
 
 import pandas as pd
 
-from .database import MCFDatabase
+from .db_factory import open_database
 from .models import (
     Address,
     Company,
@@ -412,7 +412,7 @@ class MCFMigrator:
         Args:
             db_path: Path to SQLite database
         """
-        self.db = MCFDatabase(db_path)
+        self.db = open_database(db_path)
         self.parser = LegacyJobParser()
         self._seen_uuids: set[str] = set()
 

@@ -42,6 +42,17 @@ from src.mcf import (
     MCFScraper,
     ScraperDaemon,
 )
+from src.mcf.db_backup import create_sqlite_hot_backup, verify_sqlite_backup
+from src.mcf.db_factory import open_database
+from src.mcf.db_target import resolve_database_target
+from src.mcf.hosted_slice import DEFAULT_HOSTED_SLICE_POLICY, HostedSlicePolicy
+from src.mcf.postgres_migration import (
+    audit_sqlite_source,
+    migrate_sqlite_backup_to_postgres,
+    purge_hosted_slice,
+    seed_hosted_slice_from_postgres,
+    write_migration_report,
+)
 from src.mcf.embeddings import (
     FAISSIndexManager,
     IndexCompatibilityError,
@@ -60,6 +71,20 @@ app = typer.Typer(
 )
 console = Console()
 CLI_DEFAULT_EMBEDDING_BACKEND = "onnx"
+
+
+def _open_database(
+    db_path: str,
+    *,
+    read_only: bool = False,
+    ensure_schema: bool = True,
+):
+    """Open a database target while preserving the existing --db CLI surface."""
+    return open_database(
+        db_path,
+        read_only=read_only,
+        ensure_schema=ensure_schema,
+    )
 
 
 def _default_onnx_model_dir(model_name: str) -> Path:
@@ -412,7 +437,7 @@ def list_jobs(
         mcf list --company Google --salary-min 8000
         mcf list --employment-type "Full Time"
     """
-    db = MCFDatabase(db_path, read_only=True)
+    db = _open_database(db_path, read_only=True)
 
     jobs = db.search_jobs(
         company_name=company,
@@ -466,7 +491,7 @@ def search(
         mcf search "Python" --field skills
         mcf search "Senior" --field title --limit 50
     """
-    db = MCFDatabase(db_path, read_only=True)
+    db = _open_database(db_path, read_only=True)
 
     jobs = db.search_jobs(keyword=keyword, limit=limit)
 
@@ -502,7 +527,7 @@ def stats(
     """
     Show database statistics.
     """
-    db = MCFDatabase(db_path, read_only=True)
+    db = _open_database(db_path, read_only=True)
     stats_data = db.get_stats()
 
     console.print("\n[bold blue]Database Statistics[/bold blue]\n")
@@ -550,7 +575,7 @@ def export(
         mcf export high_salary.csv --salary-min 10000
         mcf export google_jobs.csv --company Google
     """
-    db = MCFDatabase(db_path, read_only=True)
+    db = _open_database(db_path, read_only=True)
 
     count = db.export_to_csv(
         output,
@@ -577,7 +602,7 @@ def history(
     Example:
         mcf history abc123-def456
     """
-    db = MCFDatabase(db_path, read_only=True)
+    db = _open_database(db_path, read_only=True)
 
     # Get current job
     job = db.get_job(uuid)
@@ -629,7 +654,7 @@ def db_status(
     """
     Show status of scrape sessions in database.
     """
-    db = MCFDatabase(db_path, read_only=True)
+    db = _open_database(db_path, read_only=True)
     sessions = db.get_all_sessions()
 
     if not sessions:
@@ -714,7 +739,7 @@ def migrate(
     console.print()
 
     # Get initial stats
-    db = MCFDatabase(db_path, read_only=True)
+    db = _open_database(db_path, read_only=True)
     initial_count = db.count_jobs()
     console.print(f"Jobs in database before migration: [cyan]{initial_count:,}[/cyan]")
     console.print()
@@ -953,7 +978,7 @@ def scrape_historical(
 
         if not dry_run:
             # Show current database stats
-            db = MCFDatabase(db_path)
+            db = _open_database(db_path)
             total_jobs = db.count_jobs()
             console.print(f"\n[bold]Total jobs in database:[/bold] [cyan]{total_jobs:,}[/cyan]")
 
@@ -970,7 +995,7 @@ def historical_status(
     Displays progress for each year being scraped, including jobs found,
     not found, and current sequence position.
     """
-    db = MCFDatabase(db_path, read_only=True)
+    db = _open_database(db_path, read_only=True)
 
     # Get sessions
     sessions = db.get_all_historical_sessions()
@@ -1107,7 +1132,7 @@ def daemon_cmd(
     setup_logging(verbose)
 
     if action == "status":
-        db = MCFDatabase(db_path, read_only=True)
+        db = _open_database(db_path, read_only=True)
         daemon = ScraperDaemon(db)
         status = daemon.status()
 
@@ -1136,7 +1161,7 @@ def daemon_cmd(
         if not year and not all_years:
             console.print("[red]Error: Must specify --year or --all for start action[/red]")
             raise typer.Exit(1)
-        db = MCFDatabase(db_path, read_only=True)
+        db = _open_database(db_path, read_only=True)
         daemon = ScraperDaemon(db)
 
         try:
@@ -1178,7 +1203,7 @@ def daemon_cmd(
             raise typer.Exit(1)
 
     elif action == "stop":
-        db = MCFDatabase(db_path, read_only=True)
+        db = _open_database(db_path, read_only=True)
         daemon = ScraperDaemon(db)
         try:
             console.print("Stopping daemon...")
@@ -1208,13 +1233,14 @@ def daemon_worker(
     wake_threshold: int = typer.Option(DEFAULT_WAKE_THRESHOLD, "--wake-threshold"),
 ) -> None:
     """Internal: daemon worker process. Do not call directly."""
-    db_exists = Path(db_path).exists()
+    db_target = resolve_database_target(db_path)
+    db_exists = db_target.is_postgres or db_target.sqlite_path.exists()
     try:
-        db = MCFDatabase(db_path)
+        db = _open_database(db_path)
     except sqlite3.OperationalError as exc:
         if not db_exists or "locked" not in str(exc).lower():
             raise
-        db = MCFDatabase(db_path, ensure_schema=False)
+        db = _open_database(db_path, ensure_schema=False)
     daemon = ScraperDaemon(
         db,
         pidfile=pidfile,
@@ -1258,7 +1284,7 @@ def show_gaps(
         mcf gaps --year 2023     # Check gaps for 2023
         mcf gaps --all           # Check all years
     """
-    db = MCFDatabase(db_path, read_only=True)
+    db = _open_database(db_path, read_only=True)
 
     if not year and not all_years:
         console.print("[red]Error: Must specify --year or --all[/red]")
@@ -1445,7 +1471,7 @@ def attempt_stats(
         mcf attempt-stats              # All years summary
         mcf attempt-stats --year 2023  # Specific year details
     """
-    db = MCFDatabase(db_path, read_only=True)
+    db = _open_database(db_path, read_only=True)
 
     console.print("\n[bold blue]Fetch Attempt Statistics[/bold blue]\n")
 
@@ -1559,7 +1585,7 @@ def generate_embeddings(
     console.print("\n[bold blue]Generating Embeddings[/bold blue]")
     console.print("━" * 40)
 
-    db = MCFDatabase(db_path)
+    db = _open_database(db_path)
     generator = _create_embedding_generator(
         backend=embedding_backend,
         onnx_model_dir=onnx_model_dir,
@@ -1809,7 +1835,7 @@ def sync_embeddings(
     console.print("\n[bold blue]Syncing Embeddings[/bold blue]")
     console.print("━" * 40)
 
-    db = MCFDatabase(db_path)
+    db = _open_database(db_path)
     generator = _create_embedding_generator(
         backend=embedding_backend,
         onnx_model_dir=onnx_model_dir,
@@ -1932,7 +1958,7 @@ def embedding_status(
     Example:
         mcf embed-status
     """
-    db = MCFDatabase(db_path)
+    db = _open_database(db_path)
     stats = db.get_embedding_stats()
 
     console.print("\n[bold blue]Embedding Status[/bold blue]")
@@ -2083,7 +2109,7 @@ def upgrade_embeddings(
     """
     setup_logging(verbose)
 
-    db = MCFDatabase(db_path)
+    db = _open_database(db_path)
     stats = db.get_embedding_stats()
 
     current_model = stats.get("model_version") or "none"
@@ -2244,7 +2270,7 @@ def compare_embedding_backends(
     """
     setup_logging(verbose)
 
-    db = MCFDatabase(db_path, read_only=True)
+    db = _open_database(db_path, read_only=True)
     torch_generator = _create_embedding_generator(model_name=model, backend="torch")
     onnx_generator = _create_embedding_generator(
         model_name=model,
@@ -2496,7 +2522,7 @@ def _display_search_results(response: SearchResponse, query: str) -> None:
 def serve_api(
     host: str = typer.Option("127.0.0.1", "--host", "-H", help="Host to bind to"),
     port: int = typer.Option(8000, "--port", "-p", help="Port to bind to"),
-    db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Path to SQLite database"),
+    db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Database path or PostgreSQL DSN"),
     index_dir: str = typer.Option("data/embeddings", "--index-dir", help="Path to FAISS indexes"),
     reload: bool = typer.Option(False, "--reload", help="Enable auto-reload for development"),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of worker processes (production)"),
@@ -2514,6 +2540,16 @@ def serve_api(
         CLI_DEFAULT_EMBEDDING_BACKEND,
         "--embedding-backend",
         help="Embedding inference backend: torch or onnx",
+    ),
+    search_backend: str = typer.Option(
+        "faiss",
+        "--search-backend",
+        help="Vector search backend: faiss or pgvector",
+    ),
+    lean_hosted: bool = typer.Option(
+        False,
+        "--lean-hosted",
+        help="Disable skill/company vector dependencies for a lean hosted slice",
     ),
     onnx_model_dir: Optional[str] = typer.Option(
         None,
@@ -2544,13 +2580,15 @@ def serve_api(
     origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
 
     # Check prerequisites
-    if not Path(db_path).exists():
+    db_target = resolve_database_target(db_path)
+    if db_target.is_sqlite and not db_target.sqlite_path.exists():
         console.print(f"[red]Error:[/red] Database not found: {db_path}")
         console.print("Run 'mcf scrape' first to populate the database.")
         raise typer.Exit(1)
 
     index_path = Path(index_dir)
-    if not (index_path / "jobs.index").exists():
+    search_backend = search_backend.lower()
+    if search_backend == "faiss" and not (index_path / "jobs.index").exists():
         console.print(f"[yellow]Warning:[/yellow] FAISS index not found in {index_dir}")
         console.print("API will run in degraded mode (keyword search only).")
         console.print("Run 'mcf embed-generate' to enable semantic search.")
@@ -2563,6 +2601,9 @@ def serve_api(
     console.print(f"  API docs:   http://{host}:{port}/docs")
     console.print(f"  CORS:       {', '.join(origins)}")
     console.print(f"  Embedding:  {embedding_backend}")
+    console.print(f"  Search:     {search_backend}")
+    if lean_hosted:
+        console.print("  Profile:    [yellow]Lean hosted slice[/yellow]")
     if onnx_model_dir:
         console.print(f"  ONNX dir:   {onnx_model_dir}")
     if api_rate_limit > 0:
@@ -2577,10 +2618,16 @@ def serve_api(
 
     # Pass config via environment so uvicorn workers can pick it up
     os.environ["MCF_DB_PATH"] = db_path
+    if db_target.is_postgres:
+        os.environ["DATABASE_URL"] = db_path
+    else:
+        os.environ.pop("DATABASE_URL", None)
     os.environ["MCF_INDEX_DIR"] = index_dir
     os.environ["MCF_CORS_ORIGINS"] = cors_origins
     os.environ["MCF_RATE_LIMIT_RPM"] = str(api_rate_limit)
     os.environ["MCF_EMBEDDING_BACKEND"] = embedding_backend
+    os.environ["MCF_SEARCH_BACKEND"] = search_backend
+    os.environ["MCF_LEAN_HOSTED"] = "1" if lean_hosted else "0"
     if onnx_model_dir:
         os.environ["MCF_ONNX_MODEL_DIR"] = str(onnx_model_dir)
     else:
@@ -2594,6 +2641,102 @@ def serve_api(
         workers=1 if reload else workers,
         log_level="info",
     )
+
+
+@app.command(name="db-backup")
+def backup_database(
+    source: str = typer.Option("data/mcf_jobs.db", "--source", help="Live SQLite source database"),
+    backup_dir: str = typer.Option("data/backups", "--backup-dir", help="Backup output directory"),
+    prefix: str = typer.Option("mcf_pre_postgres", "--prefix", help="Backup filename prefix"),
+) -> None:
+    """Create and verify a hot SQLite backup."""
+    backup_path = create_sqlite_hot_backup(source, backup_dir, prefix=prefix)
+    metadata = verify_sqlite_backup(backup_path)
+    console.print(f"[green]Backup created:[/green] {backup_path}")
+    console.print(f"Integrity: [cyan]{metadata.integrity_check}[/cyan]")
+    console.print(f"Jobs: [cyan]{metadata.jobs_count:,}[/cyan]")
+    console.print(f"Size: [cyan]{metadata.size_bytes:,} bytes[/cyan]")
+
+
+@app.command(name="pg-migrate")
+def migrate_postgres(
+    source: str = typer.Option(..., "--source", help="SQLite backup path"),
+    target: str = typer.Option(..., "--target", help="PostgreSQL DSN"),
+    report_path: str = typer.Option(
+        "data/backups/postgres_migration_report.json",
+        "--report",
+        help="Where to write the migration report",
+    ),
+    batch_size: int = typer.Option(5000, "--batch-size", help="Rows per batch"),
+    audit_only: bool = typer.Option(False, "--audit-only", help="Only run the preflight audit"),
+    truncate_first: bool = typer.Option(True, "--truncate-first/--no-truncate-first", help="Reset target tables first"),
+) -> None:
+    """Load a SQLite backup into PostgreSQL with anomaly reporting."""
+    anomalies = audit_sqlite_source(source)
+    console.print(f"Preflight anomalies: [cyan]{len(anomalies)}[/cyan]")
+    if audit_only:
+        for anomaly in anomalies[:20]:
+            console.print(f"- {anomaly.table}.{anomaly.column} row={anomaly.row_id} issue={anomaly.issue}")
+        return
+
+    report = migrate_sqlite_backup_to_postgres(
+        sqlite_path=source,
+        postgres_dsn=target,
+        batch_size=batch_size,
+        truncate_first=truncate_first,
+    )
+    write_migration_report(report, report_path)
+    console.print(f"[green]Migration complete[/green] report={report_path}")
+    for table, count in sorted(report.copied_rows.items()):
+        console.print(f"  {table}: {count:,}")
+    console.print(f"  anomalies: {len(report.anomalies):,}")
+
+
+@app.command(name="pg-seed-hosted")
+def seed_hosted(
+    source: str = typer.Option(..., "--source", help="Source PostgreSQL DSN"),
+    target: str = typer.Option(..., "--target", help="Target PostgreSQL DSN"),
+    min_posted_date: str = typer.Option(
+        DEFAULT_HOSTED_SLICE_POLICY.min_posted_date.isoformat(),
+        "--min-posted-date",
+        help="Minimum posted date to retain in the hosted slice",
+    ),
+    max_age_days: int = typer.Option(
+        DEFAULT_HOSTED_SLICE_POLICY.max_age_days,
+        "--max-age-days",
+        help="Maximum age in days for hosted rows",
+    ),
+) -> None:
+    """Seed a lean hosted slice from local Postgres."""
+    policy = HostedSlicePolicy(
+        min_posted_date=date.fromisoformat(min_posted_date),
+        max_age_days=max_age_days,
+    )
+    result = seed_hosted_slice_from_postgres(source_dsn=source, target_dsn=target, policy=policy)
+    console.print_json(data=result)
+
+
+@app.command(name="pg-purge-hosted")
+def purge_hosted(
+    target: str = typer.Option(..., "--target", help="Target PostgreSQL DSN"),
+    min_posted_date: str = typer.Option(
+        DEFAULT_HOSTED_SLICE_POLICY.min_posted_date.isoformat(),
+        "--min-posted-date",
+        help="Minimum posted date to retain in the hosted slice",
+    ),
+    max_age_days: int = typer.Option(
+        DEFAULT_HOSTED_SLICE_POLICY.max_age_days,
+        "--max-age-days",
+        help="Maximum age in days for hosted rows",
+    ),
+) -> None:
+    """Purge a hosted slice down to the lean Neon policy."""
+    policy = HostedSlicePolicy(
+        min_posted_date=date.fromisoformat(min_posted_date),
+        max_age_days=max_age_days,
+    )
+    result = purge_hosted_slice(target_dsn=target, policy=policy)
+    console.print_json(data=result)
 
 
 @app.command(name="benchmark")

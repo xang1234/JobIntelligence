@@ -85,6 +85,50 @@ def test_api_serve_defaults_to_onnx(monkeypatch, temp_dir: Path):
             os.environ["MCF_ONNX_MODEL_DIR"] = previous_model_dir
 
 
+def test_api_serve_respects_explicit_pgvector_backend(monkeypatch):
+    calls: dict[str, object] = {}
+    previous_search_backend = os.environ.get("MCF_SEARCH_BACKEND")
+    previous_database_url = os.environ.get("DATABASE_URL")
+
+    import uvicorn
+
+    def fake_run(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    monkeypatch.setattr(cli, "validate_embedding_backend_config", lambda **kwargs: None)
+    monkeypatch.setenv("MCF_SEARCH_BACKEND", "faiss")
+
+    try:
+        result = runner.invoke(
+            cli.app,
+            [
+                "api-serve",
+                "--db",
+                "postgresql://postgres:postgres@localhost:5432/mcf",
+                "--search-backend",
+                "pgvector",
+                "--lean-hosted",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert calls["args"] == ("src.api.app:app",)
+        assert os.environ["MCF_SEARCH_BACKEND"] == "pgvector"
+        assert os.environ["MCF_LEAN_HOSTED"] == "1"
+        assert os.environ["DATABASE_URL"] == "postgresql://postgres:postgres@localhost:5432/mcf"
+    finally:
+        if previous_search_backend is None:
+            os.environ.pop("MCF_SEARCH_BACKEND", None)
+        else:
+            os.environ["MCF_SEARCH_BACKEND"] = previous_search_backend
+        if previous_database_url is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = previous_database_url
+
+
 def test_benchmark_defaults_to_onnx(monkeypatch):
     calls: dict[str, object] = {}
 

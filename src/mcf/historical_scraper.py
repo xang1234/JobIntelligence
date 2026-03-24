@@ -28,7 +28,7 @@ from tenacity import RetryError
 from .adaptive_rate import AdaptiveRateLimiter
 from .api_client import MCFAPIError, MCFClient, MCFNotFoundError, MCFRateLimitError
 from .batch_logger import BatchLogger
-from .database import MCFDatabase
+from .db_factory import open_database
 from .models import Job
 
 logger = logging.getLogger(__name__)
@@ -124,7 +124,7 @@ class HistoricalScraper:
             cooldown_seconds: Global cooldown after repeated 429s
             discover_bounds: Discover a tighter end bound before scanning
         """
-        self.db = MCFDatabase(db_path)
+        self.db = open_database(db_path)
         self.initial_rps = requests_per_second
         self.not_found_threshold = not_found_threshold
         self.max_rate_limit_retries = max_rate_limit_retries

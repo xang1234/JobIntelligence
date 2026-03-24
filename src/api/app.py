@@ -36,6 +36,7 @@ from ..mcf.career_delta import (
     SkillScenarioSignal,
 )
 from ..mcf.career_delta_retrieval import SearchEngineCareerDeltaProvider
+from ..mcf.db_target import resolve_database_target
 from ..mcf.embeddings import EmbeddingGenerator, SemanticSearchEngine, validate_embedding_backend_config
 from ..mcf.embeddings.models import SimilarJobsRequest as InternalSimilarJobsRequest
 from ..mcf.industry_taxonomy import normalize_title_family
@@ -280,18 +281,24 @@ async def lifespan(app: FastAPI):
     index_dir = Path(app.state.index_dir)
     embedding_backend = app.state.embedding_backend
     onnx_model_dir = app.state.onnx_model_dir
+    search_backend = app.state.search_backend
+    lean_hosted = app.state.lean_hosted
 
     logger.info(
-        "Loading search indexes (db=%s, index_dir=%s, embedding_backend=%s)...",
+        "Loading search indexes (db=%s, index_dir=%s, embedding_backend=%s, search_backend=%s, lean_hosted=%s)...",
         db_path,
         index_dir,
         embedding_backend,
+        search_backend,
+        lean_hosted,
     )
     _search_engine = SemanticSearchEngine(
         db_path=db_path,
         index_dir=index_dir,
         embedding_backend=embedding_backend,
         onnx_model_dir=onnx_model_dir,
+        search_backend=search_backend,
+        lean_hosted=lean_hosted,
     )
 
     # Load in a thread to avoid blocking the event loop during startup
@@ -321,6 +328,8 @@ def create_app(
     index_dir: str | None = None,
     embedding_backend: str | None = None,
     onnx_model_dir: str | None = None,
+    search_backend: str | None = None,
+    lean_hosted: bool | None = None,
     cors_origins: Optional[list[str]] = None,
     rate_limit_rpm: int | None = None,
     trusted_proxies: frozenset[str] | None = None,
@@ -329,14 +338,19 @@ def create_app(
     Application factory.
 
     Args:
-        db_path: Path to the SQLite database.  Falls back to
-            ``MCF_DB_PATH`` env var, then ``"data/mcf_jobs.db"``.
+        db_path: Database path or PostgreSQL DSN. Falls back to
+            ``DATABASE_URL``, ``MCF_DATABASE_URL``, ``MCF_DB_PATH``,
+            then ``"data/mcf_jobs.db"``.
         index_dir: Directory containing FAISS indexes.  Falls back to
             ``MCF_INDEX_DIR`` env var, then ``"data/embeddings"``.
         embedding_backend: Embedding inference backend. Falls back to
             ``MCF_EMBEDDING_BACKEND`` env var, then ``"torch"``.
         onnx_model_dir: Exported ONNX model directory. Falls back to
             ``MCF_ONNX_MODEL_DIR`` env var when provided.
+        search_backend: Vector search backend. Falls back to
+            ``MCF_SEARCH_BACKEND`` env var, then ``"faiss"``.
+        lean_hosted: Disable skill/company vector features for hosted slices.
+            Falls back to ``MCF_LEAN_HOSTED`` when provided.
         cors_origins: Allowed CORS origins.  Falls back to
             ``MCF_CORS_ORIGINS`` env var (comma-separated), then
             common localhost ports.
@@ -350,14 +364,17 @@ def create_app(
     """
     import os
 
-    if db_path is None:
-        db_path = os.environ.get("MCF_DB_PATH", "data/mcf_jobs.db")
+    db_path = resolve_database_target(db_path).value
     if index_dir is None:
         index_dir = os.environ.get("MCF_INDEX_DIR", "data/embeddings")
     if embedding_backend is None:
         embedding_backend = os.environ.get("MCF_EMBEDDING_BACKEND", "torch")
     if onnx_model_dir is None:
         onnx_model_dir = os.environ.get("MCF_ONNX_MODEL_DIR")
+    if search_backend is None:
+        search_backend = os.environ.get("MCF_SEARCH_BACKEND", "faiss")
+    if lean_hosted is None:
+        lean_hosted = os.environ.get("MCF_LEAN_HOSTED", "").strip().lower() in {"1", "true", "yes", "on"}
     validate_embedding_backend_config(
         backend=embedding_backend,
         model_name=EmbeddingGenerator.MODEL_NAME,
@@ -393,6 +410,8 @@ def create_app(
     app.state.index_dir = index_dir
     app.state.embedding_backend = embedding_backend
     app.state.onnx_model_dir = onnx_model_dir
+    app.state.search_backend = search_backend
+    app.state.lean_hosted = lean_hosted
     app.state.rate_limit_rpm = rate_limit_rpm
     app.state.career_delta_detail_ttl_seconds = 300
     app.state.career_delta_detail_cache_max_entries = 256

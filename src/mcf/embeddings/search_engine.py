@@ -3,7 +3,7 @@ Semantic Search Engine for MCF job data.
 
 Orchestrates hybrid semantic + keyword search by combining:
 - SQL filtering (salary, location, employment type)
-- FAISS vector search (semantic similarity)
+- Vector search (FAISS locally, pgvector on Postgres)
 - FTS5 BM25 search (keyword relevance)
 - Query expansion (synonym matching via skill clusters)
 - Result caching (performance optimization)
@@ -24,6 +24,7 @@ Example:
 """
 
 import logging
+import os
 import re
 import time
 from datetime import date
@@ -33,11 +34,11 @@ from typing import Optional
 import numpy as np
 from cachetools import TTLCache
 
-from ..database import MCFDatabase
+from ..db_factory import open_database
 from .backends import DEFAULT_EMBEDDING_BACKEND, resolve_model_version
+from .faiss_backend import FAISSVectorBackend
 from .generator import EmbeddingGenerator
 from .index_manager import (
-    FAISSIndexManager,
     IndexCompatibilityError,
     IndexNotBuiltError,
 )
@@ -51,6 +52,7 @@ from .models import (
     SimilarJobsRequest,
     SkillSearchRequest,
 )
+from .pgvector_backend import PGVectorBackend
 from .query_expander import QueryExpander
 
 logger = logging.getLogger(__name__)
@@ -62,7 +64,7 @@ class SemanticSearchEngine:
 
     Combines multiple search strategies:
     - SQL filtering for hard constraints (salary, location, type)
-    - FAISS vector search for semantic similarity
+    - Vector search for semantic similarity
     - FTS5 BM25 search for keyword relevance
     - Query expansion for synonym matching
     - Result caching for performance
@@ -95,28 +97,42 @@ class SemanticSearchEngine:
         model_version: str = "all-MiniLM-L6-v2",
         embedding_backend: str = DEFAULT_EMBEDDING_BACKEND,
         onnx_model_dir: str | Path | None = None,
+        search_backend: str | None = None,
+        lean_hosted: bool = False,
     ):
         """
         Initialize the search engine.
 
         Args:
-            db_path: Path to SQLite database
+            db_path: Path or DSN for the configured database
             index_dir: Directory containing FAISS indexes
             model_version: Embedding model version for compatibility
             embedding_backend: Embedding inference backend for query encoding
             onnx_model_dir: Exported ONNX model directory when backend='onnx'
+            search_backend: Vector backend name ('faiss' or 'pgvector')
+            lean_hosted: Disable skill/company vector dependencies for hosted slices
         """
-        self.db = MCFDatabase(db_path, ensure_schema=False)
+        self.db = open_database(db_path, ensure_schema=False)
         self.index_dir = Path(index_dir)
         self.embedding_backend = embedding_backend
         self.onnx_model_dir = Path(onnx_model_dir) if onnx_model_dir is not None else None
         self.model_version = resolve_model_version(model_version, embedding_backend)
+        self.search_backend = (search_backend or os.environ.get("MCF_SEARCH_BACKEND") or "faiss").lower()
+        env_lean_hosted = os.environ.get("MCF_LEAN_HOSTED", "").strip().lower() in {"1", "true", "yes", "on"}
+        self.lean_hosted = lean_hosted or env_lean_hosted
 
         # Components (loaded lazily)
-        self.index_manager = FAISSIndexManager(
-            index_dir=self.index_dir,
-            model_version=self.model_version,
-        )
+        if self.search_backend == "pgvector":
+            self.vector_backend = PGVectorBackend(
+                self.db,
+                model_version=self.model_version,
+                lean_hosted=self.lean_hosted,
+            )
+        else:
+            self.vector_backend = FAISSVectorBackend(
+                index_dir=self.index_dir,
+                model_version=self.model_version,
+            )
         self.generator = EmbeddingGenerator(
             model_name=model_version,
             backend=embedding_backend,
@@ -156,35 +172,37 @@ class SemanticSearchEngine:
 
         logger.info("Loading semantic search engine...")
 
-        # Try to load FAISS indexes
+        # Try to load vector search backend
         try:
-            if self.index_manager.exists():
-                self.index_manager.load()
+            if self.vector_backend.exists():
+                self.vector_backend.load()
                 self._has_vector_index = True
-                logger.info("FAISS indexes loaded successfully")
+                logger.info("Vector backend loaded successfully (%s)", self.search_backend)
             else:
                 logger.warning(
-                    f"FAISS indexes not found at {self.index_dir}. " "Run 'mcf embed-generate' to build indexes."
+                    "Vector backend not found at %s. Run 'mcf embed-generate' to build indexes.",
+                    self.index_dir,
                 )
                 self._degraded = True
         except IndexCompatibilityError as e:
             logger.warning(f"Index compatibility error: {e}. Falling back to keyword search.")
             self._degraded = True
         except Exception as e:
-            logger.warning(f"Failed to load FAISS indexes: {e}. Falling back to keyword search.")
+            logger.warning(f"Failed to load vector backend: {e}. Falling back to keyword search.")
             self._degraded = True
 
         # Try to load query expander (skill clusters)
-        try:
-            self.query_expander = QueryExpander.load(self.index_dir)
-            self._has_skill_clusters = True
-            logger.info(f"Query expander loaded: {self.query_expander.get_stats()}")
-        except FileNotFoundError:
-            logger.warning(
-                "Skill clusters not found. Query expansion disabled. " "Run 'mcf embed-generate' to create clusters."
-            )
-        except Exception as e:
-            logger.warning(f"Failed to load query expander: {e}")
+        if not self.lean_hosted:
+            try:
+                self.query_expander = QueryExpander.load(self.index_dir)
+                self._has_skill_clusters = True
+                logger.info(f"Query expander loaded: {self.query_expander.get_stats()}")
+            except FileNotFoundError:
+                logger.warning(
+                    "Skill clusters not found. Query expansion disabled. " "Run 'mcf embed-generate' to create clusters."
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load query expander: {e}")
 
         self._loaded = True
         return not self._degraded
@@ -223,9 +241,8 @@ class SemanticSearchEngine:
         try:
             # Step 1: Get candidates
             # When SQL filters are active, they constrain the result set.
-            # When unfiltered AND vectors are available, use FAISS to search the
-            # full index directly — avoids loading millions of rows into memory
-            # just to pass them back to FAISS.
+            # When unfiltered and vectors are available, search the full vector
+            # backend directly to avoid loading millions of rows just to re-rank.
             has_filters = self._has_sql_filters(request)
 
             if has_filters:
@@ -233,16 +250,16 @@ class SemanticSearchEngine:
                 total_candidates = len(candidates)
                 candidate_uuids = [c["uuid"] for c in candidates]
             elif self._has_vector_index and not self._degraded:
-                # Vector-first path: let FAISS find the best semantic matches
-                # from the full index, then score those with BM25.
+                # Vector-first path: let the configured backend find the best
+                # semantic matches from the full index, then score with BM25.
                 vector_k = max(1000, request.limit * 50)
                 query_embedding = self._get_query_embedding(request.query)
-                semantic_results = self.index_manager.search_jobs(
+                semantic_results = self.vector_backend.search_jobs(
                     query_embedding,
                     k=vector_k,
                 )
                 candidate_uuids = [uuid for uuid, _ in semantic_results]
-                total_candidates = self.index_manager.indexes["jobs"].ntotal
+                total_candidates = self.vector_backend.total_jobs()
             else:
                 # Degraded / no vectors: fall back to SQL with a generous cap
                 candidates = self._apply_sql_filters(request)
@@ -367,7 +384,7 @@ class SemanticSearchEngine:
         search_k = request.limit + 10 if request.exclude_same_company else request.limit + 1
 
         try:
-            results = self.index_manager.search_jobs(source_embedding, k=search_k)
+            results = self.vector_backend.search_jobs(source_embedding, k=search_k)
         except IndexNotBuiltError:
             return SearchResponse(
                 results=[],
@@ -475,7 +492,7 @@ class SemanticSearchEngine:
 
             # Fetch more candidates when SQL filters will reduce the set
             k_multiplier = 4 if has_sql_filters else 2
-            results = self.index_manager.search_jobs(
+            results = self.vector_backend.search_jobs(
                 skill_embedding,
                 k=request.limit * k_multiplier,
             )
@@ -553,7 +570,7 @@ class SemanticSearchEngine:
         if self._has_vector_index and not self._degraded:
             profile_embedding = self._get_query_embedding(profile_text)
             search_k = max(limit * 30, 300)
-            candidate_rows = self.index_manager.search_jobs(profile_embedding, k=search_k)
+            candidate_rows = self.vector_backend.search_jobs(profile_embedding, k=search_k)
         else:
             keyword_seed = " ".join(extracted_skills[:5]) or profile_text[:120]
             fallback = self._keyword_fallback_search(
@@ -671,8 +688,8 @@ class SemanticSearchEngine:
             return []
 
         # Primary path: use pre-computed company multi-centroid index
-        if self.index_manager.has_company_index():
-            source_centroids = self.index_manager.get_company_centroids(request.company_name)
+        if self.vector_backend.has_company_index():
+            source_centroids = self.vector_backend.get_company_centroids(request.company_name)
             if source_centroids is not None:
                 return self._find_similar_companies_multi_centroid(request, source_centroids)
 
@@ -702,7 +719,7 @@ class SemanticSearchEngine:
         # For each source centroid, search company index
         for centroid in source_centroids:
             try:
-                results = self.index_manager.search_companies(centroid, k=request.limit + 10)
+                results = self.vector_backend.search_companies(centroid, k=request.limit + 10)
             except IndexNotBuiltError:
                 continue
 
@@ -766,7 +783,7 @@ class SemanticSearchEngine:
             centroid = centroid / norm
 
         try:
-            similar_jobs = self.index_manager.search_jobs(centroid, k=500)
+            similar_jobs = self.vector_backend.search_jobs(centroid, k=500)
         except IndexNotBuiltError:
             return []
 
@@ -833,7 +850,7 @@ class SemanticSearchEngine:
         # Index stats (if loaded)
         if self._has_vector_index:
             try:
-                stats["index_stats"] = self.index_manager.get_stats()
+                stats["index_stats"] = self.vector_backend.get_stats()
             except Exception as e:
                 stats["index_stats"] = {"error": str(e)}
 
@@ -943,11 +960,11 @@ class SemanticSearchEngine:
         # Get query embedding
         query_embedding = self._get_query_embedding(query)
 
-        # Get semantic scores via filtered FAISS search
+        # Get semantic scores via filtered vector search
         try:
-            semantic_results = self.index_manager.search_jobs_filtered(
+            semantic_results = self.vector_backend.search_jobs_filtered(
                 query_embedding,
-                allowed_uuids=candidate_set,
+                candidate_uuids=list(candidate_set),
                 k=len(candidate_uuids),
             )
             semantic_scores = {uuid: score for uuid, score in semantic_results}
@@ -1409,9 +1426,9 @@ class SemanticSearchEngine:
         """
         Get skills related to a given skill.
 
-        Primary strategy: FAISS embedding similarity on the skill index,
+        Primary strategy: embedding similarity on the configured skill index,
         annotated with cluster membership from QueryExpander.
-        Fallback: cluster-only lookup when FAISS skill index is unavailable.
+        Fallback: cluster-only lookup when vector skill indexes are unavailable.
 
         Args:
             skill: Skill name to find relatives for
@@ -1427,17 +1444,11 @@ class SemanticSearchEngine:
         if self.query_expander:
             source_cluster = self.query_expander.skill_to_cluster.get(skill)
 
-        # Primary: FAISS embedding similarity
-        if (
-            self._has_vector_index
-            and "skills" in self.index_manager.indexes
-            and self.index_manager.indexes["skills"] is not None
-        ):
-            skill_idx = self.index_manager.skill_to_idx.get(skill)
-            if skill_idx is not None:
-                # Reconstruct the skill's own embedding from the Flat index
-                skill_embedding = self.index_manager.indexes["skills"].reconstruct(skill_idx)
-                similar = self.index_manager.search_skills(skill_embedding, k=k + 1)
+        # Primary: embedding similarity through the configured vector backend
+        if self._has_vector_index and self.vector_backend.has_skill_index():
+            skill_embedding = self.vector_backend.get_skill_embedding(skill)
+            if skill_embedding is not None:
+                similar = self.vector_backend.search_skills(skill_embedding, k=k + 1)
 
                 related = []
                 for s, score in similar:
