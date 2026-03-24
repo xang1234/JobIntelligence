@@ -141,7 +141,7 @@ class AnalyticsStore(Protocol):
 
 
 class ScrapeStateStore(Protocol):
-    def create_session(self, search_query: str, total_jobs: int) -> int:
+    def create_session(self, search_query: str, total_jobs: int, session_id: int | None = None) -> int:
         ...
 
     def update_session(self, session_id: int, fetched_count: int, current_offset: int) -> None:
@@ -164,6 +164,7 @@ class ScrapeStateStore(Protocol):
         year: int,
         start_seq: int,
         end_seq: int | None = None,
+        session_id: int | None = None,
         conn: Any | None = None,
     ) -> int:
         ...

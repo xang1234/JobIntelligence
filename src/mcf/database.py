@@ -1128,7 +1128,7 @@ class MCFDatabase:
 
     # Scrape session methods (replaces checkpoint functionality)
 
-    def create_session(self, search_query: str, total_jobs: int) -> int:
+    def create_session(self, search_query: str, total_jobs: int, session_id: int | None = None) -> int:
         """
         Create a new scrape session.
 
@@ -1140,14 +1140,24 @@ class MCFDatabase:
             Session ID
         """
         with self._connection() as conn:
-            cursor = conn.execute(
+            if session_id is None:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO scrape_sessions (search_query, total_jobs, status)
+                    VALUES (?, ?, 'in_progress')
+                    """,
+                    (search_query, total_jobs),
+                )
+                return cursor.lastrowid
+
+            conn.execute(
                 """
-                INSERT INTO scrape_sessions (search_query, total_jobs, status)
-                VALUES (?, ?, 'in_progress')
+                INSERT INTO scrape_sessions (id, search_query, total_jobs, status)
+                VALUES (?, ?, ?, 'in_progress')
                 """,
-                (search_query, total_jobs),
+                (session_id, search_query, total_jobs),
             )
-            return cursor.lastrowid
+            return session_id
 
     def update_session(
         self,
@@ -1282,6 +1292,7 @@ class MCFDatabase:
         year: int,
         start_seq: int,
         end_seq: Optional[int] = None,
+        session_id: int | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> int:
         """
@@ -1300,17 +1311,29 @@ class MCFDatabase:
             conn = self._connect(write_optimized=True)
 
         try:
-            cursor = conn.execute(
-                """
-                INSERT INTO historical_scrape_progress
-                    (year, start_seq, current_seq, end_seq, status)
-                VALUES (?, ?, ?, ?, 'in_progress')
-                """,
-                (year, start_seq, start_seq, end_seq),
-            )
+            if session_id is None:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO historical_scrape_progress
+                        (year, start_seq, current_seq, end_seq, status)
+                    VALUES (?, ?, ?, ?, 'in_progress')
+                    """,
+                    (year, start_seq, start_seq, end_seq),
+                )
+                created_id = cursor.lastrowid
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO historical_scrape_progress
+                        (id, year, start_seq, current_seq, end_seq, status)
+                    VALUES (?, ?, ?, ?, ?, 'in_progress')
+                    """,
+                    (session_id, year, start_seq, start_seq, end_seq),
+                )
+                created_id = session_id
             if owns_connection:
                 conn.commit()
-            return cursor.lastrowid
+            return created_id
         except Exception:
             if owns_connection:
                 conn.rollback()

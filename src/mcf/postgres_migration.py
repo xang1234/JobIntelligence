@@ -27,6 +27,13 @@ TABLE_COPY_ORDER = [
     "search_analytics",
 ]
 
+SEQUENCE_RESET_TABLES = (
+    "scrape_sessions",
+    "historical_scrape_progress",
+    "fetch_attempts",
+    "search_analytics",
+)
+
 
 @dataclass
 class MigrationAnomaly:
@@ -74,25 +81,26 @@ def audit_sqlite_source(sqlite_path: str | Path) -> list[MigrationAnomaly]:
     conn = _open_sqlite_source(sqlite_path)
     anomalies: list[MigrationAnomaly] = []
     try:
-        rows = conn.execute(
+        for batch in _stream_sqlite_rows(
+            conn,
             """
             SELECT uuid, posted_date, expiry_date
             FROM jobs
-            """
-        ).fetchall()
-        for row in rows:
-            for column in ("posted_date", "expiry_date"):
-                raw_value = row[column]
-                if not _is_iso_date(raw_value):
-                    anomalies.append(
-                        MigrationAnomaly(
-                            table="jobs",
-                            row_id=row["uuid"],
-                            column=column,
-                            raw_value=str(raw_value),
-                            issue="invalid_iso_date",
+            """,
+        ):
+            for row in batch:
+                for column in ("posted_date", "expiry_date"):
+                    raw_value = row[column]
+                    if not _is_iso_date(raw_value):
+                        anomalies.append(
+                            MigrationAnomaly(
+                                table="jobs",
+                                row_id=row["uuid"],
+                                column=column,
+                                raw_value=str(raw_value),
+                                issue="invalid_iso_date",
+                            )
                         )
-                    )
     finally:
         conn.close()
     return anomalies
@@ -146,6 +154,38 @@ def _chunked(iterable: Iterable[Any], size: int) -> Iterable[list[Any]]:
         yield chunk
 
 
+def _stream_sqlite_rows(
+    conn: sqlite3.Connection,
+    query: str,
+    params: tuple[Any, ...] = (),
+    *,
+    fetch_size: int = 5000,
+) -> Iterable[list[sqlite3.Row]]:
+    cursor = conn.execute(query, params)
+    while True:
+        rows = cursor.fetchmany(fetch_size)
+        if not rows:
+            break
+        yield rows
+
+
+def _reset_postgres_sequences(conn: Any, tables: Iterable[str] = SEQUENCE_RESET_TABLES) -> None:
+    for table in tables:
+        seq_row = conn.execute(
+            "SELECT pg_get_serial_sequence(%s, 'id') AS sequence_name",
+            (table,),
+        ).fetchone()
+        sequence_name = seq_row["sequence_name"] if seq_row else None
+        if not sequence_name:
+            continue
+
+        max_id = conn.execute(f"SELECT MAX(id) AS max_id FROM {table}").fetchone()["max_id"]
+        if max_id is None:
+            conn.execute("SELECT setval(CAST(%s AS regclass), %s, false)", (sequence_name, 1))
+        else:
+            conn.execute("SELECT setval(CAST(%s AS regclass), %s, true)", (sequence_name, max_id))
+
+
 def migrate_sqlite_backup_to_postgres(
     *,
     sqlite_path: str | Path,
@@ -167,9 +207,8 @@ def migrate_sqlite_backup_to_postgres(
             _truncate_postgres_target(target)
 
         with target._connection() as conn:
-            job_rows = source.execute("SELECT * FROM jobs ORDER BY id").fetchall()
             copied = 0
-            for chunk in _chunked(job_rows, batch_size):
+            for chunk in _stream_sqlite_rows(source, "SELECT * FROM jobs ORDER BY id", fetch_size=batch_size):
                 for row in chunk:
                     payload = _coerce_job_row(row, report)
                     target._insert_job(conn, payload, payload.get("last_updated_at") or datetime.now().isoformat())
@@ -177,40 +216,50 @@ def migrate_sqlite_backup_to_postgres(
             report.copied_rows["jobs"] = copied
 
         with target._connection() as conn:
-            history_rows = source.execute(
+            copied = 0
+            for chunk in _stream_sqlite_rows(
+                source,
                 """
                 SELECT job_uuid, title, company_name, salary_min, salary_max,
                        applications_count, description, recorded_at
                 FROM job_history ORDER BY id
-                """
-            ).fetchall()
-            conn.executemany(
-                """
-                INSERT INTO job_history (
-                    job_uuid, title, company_name, salary_min, salary_max,
-                    applications_count, description, recorded_at
-                ) VALUES (
-                    %(job_uuid)s, %(title)s, %(company_name)s, %(salary_min)s, %(salary_max)s,
-                    %(applications_count)s, %(description)s, %(recorded_at)s
-                )
                 """,
-                [dict(row) for row in history_rows],
-            )
-            report.copied_rows["job_history"] = len(history_rows)
+                fetch_size=batch_size,
+            ):
+                conn.executemany(
+                    """
+                    INSERT INTO job_history (
+                        job_uuid, title, company_name, salary_min, salary_max,
+                        applications_count, description, recorded_at
+                    ) VALUES (
+                        %(job_uuid)s, %(title)s, %(company_name)s, %(salary_min)s, %(salary_max)s,
+                        %(applications_count)s, %(description)s, %(recorded_at)s
+                    )
+                    """,
+                    [dict(row) for row in chunk],
+                )
+                copied += len(chunk)
+            report.copied_rows["job_history"] = copied
 
             for table in ("scrape_sessions", "historical_scrape_progress", "fetch_attempts", "search_analytics"):
-                rows = source.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
-                if rows:
-                    columns = rows[0].keys()
-                    column_list = ", ".join(columns)
-                    value_list = ", ".join(f"%({column})s" for column in columns)
+                copied = 0
+                column_list: str | None = None
+                value_list: str | None = None
+                for chunk in _stream_sqlite_rows(source, f"SELECT * FROM {table} ORDER BY id", fetch_size=batch_size):
+                    if column_list is None or value_list is None:
+                        columns = chunk[0].keys()
+                        column_list = ", ".join(columns)
+                        value_list = ", ".join(f"%({column})s" for column in columns)
                     conn.executemany(
                         f"INSERT INTO {table} ({column_list}) VALUES ({value_list})",
-                        [dict(row) for row in rows],
+                        [dict(row) for row in chunk],
                     )
-                report.copied_rows[table] = len(rows)
+                    copied += len(chunk)
+                report.copied_rows[table] = copied
 
-            daemon_rows = source.execute("SELECT * FROM daemon_state").fetchall()
+            daemon_rows: list[dict[str, Any]] = []
+            for chunk in _stream_sqlite_rows(source, "SELECT * FROM daemon_state", fetch_size=batch_size):
+                daemon_rows.extend(dict(row) for row in chunk)
             if daemon_rows:
                 conn.execute("DELETE FROM daemon_state")
                 conn.executemany(
@@ -218,16 +267,18 @@ def migrate_sqlite_backup_to_postgres(
                     INSERT INTO daemon_state (id, pid, status, last_heartbeat, started_at, current_year, current_seq)
                     VALUES (%(id)s, %(pid)s, %(status)s, %(last_heartbeat)s, %(started_at)s, %(current_year)s, %(current_seq)s)
                     """,
-                    [dict(row) for row in daemon_rows],
+                    daemon_rows,
                 )
             report.copied_rows["daemon_state"] = len(daemon_rows)
+            _reset_postgres_sequences(conn)
 
         with target._connection() as conn:
-            embedding_rows = source.execute(
-                "SELECT entity_id, entity_type, embedding_blob, model_version FROM embeddings ORDER BY id"
-            ).fetchall()
             copied = 0
-            for chunk in _chunked(embedding_rows, batch_size):
+            for chunk in _stream_sqlite_rows(
+                source,
+                "SELECT entity_id, entity_type, embedding_blob, model_version FROM embeddings ORDER BY id",
+                fetch_size=batch_size,
+            ):
                 payloads = [
                     (
                         row["entity_id"],

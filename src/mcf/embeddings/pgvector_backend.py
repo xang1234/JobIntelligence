@@ -23,11 +23,15 @@ class PGVectorBackend:
         self.model_version = model_version
         self.lean_hosted = lean_hosted
 
+    def _job_embeddings_available(self) -> bool:
+        stats = self.db.get_embedding_stats()
+        return int(stats.get("job_embeddings", 0) or 0) > 0
+
     def exists(self) -> bool:
-        return True
+        return self._job_embeddings_available()
 
     def load(self) -> bool:
-        return True
+        return self._job_embeddings_available()
 
     def search_jobs(self, query_vector: np.ndarray, k: int = 10) -> list[tuple[str, float]]:
         return self.db.vector_search(

@@ -586,16 +586,26 @@ class PostgresDatabase:
         with self._connection() as conn:
             return conn.execute("SELECT COUNT(*) AS count FROM jobs").fetchone()["count"]
 
-    def create_session(self, search_query: str, total_jobs: int) -> int:
+    def create_session(self, search_query: str, total_jobs: int, session_id: int | None = None) -> int:
         with self._connection() as conn:
-            row = conn.execute(
-                """
-                INSERT INTO scrape_sessions (search_query, total_jobs, status)
-                VALUES (%s, %s, 'in_progress')
-                RETURNING id
-                """,
-                (search_query, total_jobs),
-            ).fetchone()
+            if session_id is None:
+                row = conn.execute(
+                    """
+                    INSERT INTO scrape_sessions (search_query, total_jobs, status)
+                    VALUES (%s, %s, 'in_progress')
+                    RETURNING id
+                    """,
+                    (search_query, total_jobs),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    INSERT INTO scrape_sessions (id, search_query, total_jobs, status)
+                    VALUES (%s, %s, %s, 'in_progress')
+                    RETURNING id
+                    """,
+                    (session_id, search_query, total_jobs),
+                ).fetchone()
         return self._fetch_id(row)
 
     def update_session(self, session_id: int, fetched_count: int, current_offset: int) -> None:
@@ -669,21 +679,33 @@ class PostgresDatabase:
         year: int,
         start_seq: int,
         end_seq: Optional[int] = None,
+        session_id: int | None = None,
         conn: Any | None = None,
     ) -> int:
         owns = conn is None
         if conn is None:
             conn = self._connect(write_optimized=True)
         try:
-            row = conn.execute(
-                """
-                INSERT INTO historical_scrape_progress
-                    (year, start_seq, current_seq, end_seq, status)
-                VALUES (%s, %s, %s, %s, 'in_progress')
-                RETURNING id
-                """,
-                (year, start_seq, start_seq, end_seq),
-            ).fetchone()
+            if session_id is None:
+                row = conn.execute(
+                    """
+                    INSERT INTO historical_scrape_progress
+                        (year, start_seq, current_seq, end_seq, status)
+                    VALUES (%s, %s, %s, %s, 'in_progress')
+                    RETURNING id
+                    """,
+                    (year, start_seq, start_seq, end_seq),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    INSERT INTO historical_scrape_progress
+                        (id, year, start_seq, current_seq, end_seq, status)
+                    VALUES (%s, %s, %s, %s, %s, 'in_progress')
+                    RETURNING id
+                    """,
+                    (session_id, year, start_seq, start_seq, end_seq),
+                ).fetchone()
             if owns:
                 conn.commit()
             return self._fetch_id(row)

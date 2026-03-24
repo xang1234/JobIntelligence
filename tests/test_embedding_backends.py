@@ -16,6 +16,7 @@ from src.mcf.embeddings.backends import (
     resolve_model_version,
 )
 from src.mcf.embeddings.generator import EmbeddingGenerator
+from src.mcf.embeddings.pgvector_backend import PGVectorBackend
 from src.mcf.embeddings.search_engine import SemanticSearchEngine
 from tests.factories import generate_test_job
 
@@ -140,6 +141,23 @@ def test_create_app_prefers_database_url_env(monkeypatch):
     app = create_app()
 
     assert app.state.db_path == "postgresql://postgres:postgres@localhost:5432/mcf"
+
+
+def test_pgvector_backend_requires_job_embeddings():
+    class _FakeEmbeddingDB:
+        def __init__(self, job_embeddings: int):
+            self.job_embeddings = job_embeddings
+
+        def get_embedding_stats(self):
+            return {"job_embeddings": self.job_embeddings}
+
+    empty_backend = PGVectorBackend(_FakeEmbeddingDB(0), model_version="all-MiniLM-L6-v2")
+    ready_backend = PGVectorBackend(_FakeEmbeddingDB(5), model_version="all-MiniLM-L6-v2")
+
+    assert empty_backend.exists() is False
+    assert empty_backend.load() is False
+    assert ready_backend.exists() is True
+    assert ready_backend.load() is True
 
 
 def test_create_app_fails_fast_for_missing_onnx_model_dir():

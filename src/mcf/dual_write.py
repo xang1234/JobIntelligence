@@ -37,6 +37,12 @@ class DualWriteDatabase:
         self.primary = primary
         self.secondary = secondary
 
+    @staticmethod
+    def _secondary_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        secondary_kwargs = dict(kwargs)
+        secondary_kwargs.pop("conn", None)
+        return secondary_kwargs
+
     def __getattr__(self, name: str) -> Any:
         primary_attr = getattr(self.primary, name)
         if name not in WRITE_METHODS or not callable(primary_attr):
@@ -44,10 +50,20 @@ class DualWriteDatabase:
 
         secondary_attr = getattr(self.secondary, name)
 
+        if name in {"create_session", "create_historical_session"}:
+
+            def _wrapped_create(*args: Any, **kwargs: Any) -> Any:
+                result = primary_attr(*args, **kwargs)
+                secondary_kwargs = self._secondary_kwargs(kwargs)
+                secondary_kwargs["session_id"] = int(result)
+                secondary_attr(*args, **secondary_kwargs)
+                return result
+
+            return _wrapped_create
+
         def _wrapped(*args: Any, **kwargs: Any) -> Any:
             result = primary_attr(*args, **kwargs)
-            secondary_kwargs = dict(kwargs)
-            secondary_kwargs.pop("conn", None)
+            secondary_kwargs = self._secondary_kwargs(kwargs)
             secondary_attr(*args, **secondary_kwargs)
             return result
 

@@ -260,6 +260,11 @@ class SemanticSearchEngine:
                 )
                 candidate_uuids = [uuid for uuid, _ in semantic_results]
                 total_candidates = self.vector_backend.total_jobs()
+                if not candidate_uuids:
+                    logger.warning("Vector backend returned no candidates; falling back to SQL candidate selection.")
+                    candidates = self._apply_sql_filters(request)
+                    total_candidates = len(candidates)
+                    candidate_uuids = [c["uuid"] for c in candidates]
             else:
                 # Degraded / no vectors: fall back to SQL with a generous cap
                 candidates = self._apply_sql_filters(request)

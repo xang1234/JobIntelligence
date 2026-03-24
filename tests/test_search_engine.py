@@ -15,6 +15,7 @@ Tests cover:
 import pickle
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from src.mcf.database import MCFDatabase
@@ -304,6 +305,36 @@ class TestSearchWithIndexes:
 
         for result in response.results:
             assert result.similarity_score >= 0.5
+
+    def test_search_falls_back_when_vector_candidates_are_empty(self, search_engine: SemanticSearchEngine):
+        """Test vector-first search falls back to SQL candidates when vectors return nothing."""
+
+        class _EmptyVectorBackend:
+            def search_jobs(self, query_vector, k=10):
+                return []
+
+            def search_jobs_filtered(self, query_vector, candidate_uuids, k=10):
+                return []
+
+            def total_jobs(self):
+                return 20
+
+            def has_skill_index(self):
+                return False
+
+            def has_company_index(self):
+                return False
+
+        search_engine.vector_backend = _EmptyVectorBackend()
+        search_engine._loaded = True
+        search_engine._degraded = False
+        search_engine._has_vector_index = True
+        search_engine._get_query_embedding = lambda query: np.ones(384, dtype=np.float32)
+
+        response = search_engine.search(SearchRequest(query="engineer", limit=5))
+
+        assert response.total_candidates > 0
+        assert response.results
 
 
 # =============================================================================
