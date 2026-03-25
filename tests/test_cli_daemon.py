@@ -15,10 +15,11 @@ def test_daemon_start_uses_read_only_database(monkeypatch, temp_dir: Path):
     db_path = temp_dir / "test.db"
     calls: dict[str, object] = {}
 
-    class FakeDB:
-        def __init__(self, path: str, read_only: bool = False):
-            calls["db_path"] = path
-            calls["read_only"] = read_only
+    def fake_open_database(path: str | None, *, read_only: bool = False, ensure_schema: bool = True):
+        calls["db_path"] = path
+        calls["read_only"] = read_only
+        calls["ensure_schema"] = ensure_schema
+        return object()
 
     class FakeDaemon:
         logfile = temp_dir / "scraper_daemon.log"
@@ -30,7 +31,7 @@ def test_daemon_start_uses_read_only_database(monkeypatch, temp_dir: Path):
             calls["start_kwargs"] = kwargs
             return 12345
 
-    monkeypatch.setattr(cli, "MCFDatabase", FakeDB)
+    monkeypatch.setattr(cli, "_open_database", fake_open_database)
     monkeypatch.setattr(cli, "ScraperDaemon", FakeDaemon)
 
     result = runner.invoke(
@@ -41,6 +42,7 @@ def test_daemon_start_uses_read_only_database(monkeypatch, temp_dir: Path):
     assert result.exit_code == 0
     assert calls["db_path"] == str(db_path)
     assert calls["read_only"] is True
+    assert calls["ensure_schema"] is True
     assert calls["start_kwargs"] == {
         "year": 2022,
         "all_years": False,
@@ -58,16 +60,11 @@ def test_daemon_worker_skips_schema_on_locked_existing_database(monkeypatch, tem
     db_path.touch()
     calls: list[tuple[str, bool, bool]] = []
 
-    class FakeDB:
-        def __init__(
-            self,
-            path: str,
-            read_only: bool = False,
-            ensure_schema: bool = True,
-        ):
-            calls.append((path, read_only, ensure_schema))
-            if ensure_schema:
-                raise sqlite3.OperationalError("database is locked")
+    def fake_open_database(path: str | None, *, read_only: bool = False, ensure_schema: bool = True):
+        calls.append((str(path), read_only, ensure_schema))
+        if ensure_schema:
+            raise sqlite3.OperationalError("database is locked")
+        return object()
 
     class FakeDaemon:
         def __init__(self, db, **kwargs):
@@ -76,7 +73,7 @@ def test_daemon_worker_skips_schema_on_locked_existing_database(monkeypatch, tem
         def run_worker(self, scraper_func):
             return None
 
-    monkeypatch.setattr(cli, "MCFDatabase", FakeDB)
+    monkeypatch.setattr(cli, "_open_database", fake_open_database)
     monkeypatch.setattr(cli, "ScraperDaemon", FakeDaemon)
 
     result = runner.invoke(
@@ -95,10 +92,8 @@ def test_daemon_start_fails_cleanly_when_database_is_busy(monkeypatch, temp_dir:
     """Start should surface daemon startup failures cleanly."""
     db_path = temp_dir / "test.db"
 
-    class FakeDB:
-        def __init__(self, path: str, read_only: bool = False):
-            self.path = path
-            self.read_only = read_only
+    def fake_open_database(path: str | None, *, read_only: bool = False, ensure_schema: bool = True):
+        return object()
 
     class FakeDaemon:
         def __init__(self, db):
@@ -107,7 +102,7 @@ def test_daemon_start_fails_cleanly_when_database_is_busy(monkeypatch, temp_dir:
         def start(self, **kwargs):
             raise cli.DaemonError("Database is busy: another process is writing to it")
 
-    monkeypatch.setattr(cli, "MCFDatabase", FakeDB)
+    monkeypatch.setattr(cli, "_open_database", fake_open_database)
     monkeypatch.setattr(cli, "ScraperDaemon", FakeDaemon)
 
     result = runner.invoke(
@@ -117,3 +112,35 @@ def test_daemon_start_fails_cleanly_when_database_is_busy(monkeypatch, temp_dir:
 
     assert result.exit_code == 1
     assert "Database is busy" in result.stdout
+
+
+def test_daemon_start_uses_persisted_database_target_when_db_is_omitted(monkeypatch, temp_dir: Path):
+    calls: dict[str, object] = {}
+    persisted_dsn = "postgresql://postgres@127.0.0.1:55432/mcf"
+
+    def fake_open_database(path: str | None, *, read_only: bool = False, ensure_schema: bool = True):
+        calls["db_path"] = path
+        calls["read_only"] = read_only
+        return object()
+
+    class FakeDaemon:
+        logfile = temp_dir / "scraper_daemon.log"
+
+        def __init__(self, db):
+            self.db = db
+
+        def start(self, **kwargs):
+            calls["start_kwargs"] = kwargs
+            return 9876
+
+    monkeypatch.setattr(cli, "_open_database", fake_open_database)
+    monkeypatch.setattr(cli, "ScraperDaemon", FakeDaemon)
+    monkeypatch.setattr(cli, "resolve_database_value_from_env", lambda: None)
+    monkeypatch.setattr(cli, "read_persisted_database_target", lambda: persisted_dsn)
+
+    result = runner.invoke(cli.app, ["daemon", "start", "--year", "2022"])
+
+    assert result.exit_code == 0
+    assert calls["db_path"] == persisted_dsn
+    assert calls["read_only"] is True
+    assert calls["start_kwargs"]["db_path"] == persisted_dsn

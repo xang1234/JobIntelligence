@@ -44,7 +44,11 @@ from src.mcf import (
 )
 from src.mcf.db_backup import create_sqlite_hot_backup, verify_sqlite_backup
 from src.mcf.db_factory import open_database
-from src.mcf.db_target import resolve_database_target
+from src.mcf.db_target import (
+    read_persisted_database_target,
+    resolve_database_target,
+    resolve_database_value_from_env,
+)
 from src.mcf.hosted_slice import DEFAULT_HOSTED_SLICE_POLICY, HostedSlicePolicy
 from src.mcf.postgres_migration import (
     audit_sqlite_source,
@@ -74,7 +78,7 @@ CLI_DEFAULT_EMBEDDING_BACKEND = "onnx"
 
 
 def _open_database(
-    db_path: str,
+    db_path: str | None,
     *,
     read_only: bool = False,
     ensure_schema: bool = True,
@@ -85,6 +89,19 @@ def _open_database(
         read_only=read_only,
         ensure_schema=ensure_schema,
     )
+
+
+def _resolve_daemon_db_path(db_path: str | None) -> str:
+    """Resolve the daemon database target, allowing a persisted local Postgres default."""
+    if db_path:
+        return resolve_database_target(db_path).value
+    env_value = resolve_database_value_from_env()
+    if env_value:
+        return resolve_database_target(env_value).value
+    persisted_value = read_persisted_database_target()
+    if persisted_value:
+        return resolve_database_target(persisted_value).value
+    return resolve_database_target(None).value
 
 
 def _default_onnx_model_dir(model_name: str) -> Path:
@@ -1114,7 +1131,7 @@ def daemon_cmd(
         "--discover-bounds/--no-discover-bounds",
         help="Discover a tighter end bound before scanning",
     ),
-    db_path: str = typer.Option("data/mcf_jobs.db", "--db", help="Database path"),
+    db_path: Optional[str] = typer.Option(None, "--db", help="Database path or PostgreSQL DSN"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Debug logging"),
 ) -> None:
     """
@@ -1130,9 +1147,10 @@ def daemon_cmd(
         mcf daemon stop                  # Stop the daemon
     """
     setup_logging(verbose)
+    resolved_db_path = _resolve_daemon_db_path(db_path)
 
     if action == "status":
-        db = _open_database(db_path, read_only=True)
+        db = _open_database(resolved_db_path, read_only=True)
         daemon = ScraperDaemon(db)
         status = daemon.status()
 
@@ -1161,7 +1179,7 @@ def daemon_cmd(
         if not year and not all_years:
             console.print("[red]Error: Must specify --year or --all for start action[/red]")
             raise typer.Exit(1)
-        db = _open_database(db_path, read_only=True)
+        db = _open_database(resolved_db_path, read_only=True)
         daemon = ScraperDaemon(db)
 
         try:
@@ -1176,14 +1194,14 @@ def daemon_cmd(
             console.print(f"Max 429 retries: {max_rate_limit_retries}")
             console.print(f"429 cooldown: {cooldown_seconds:.1f}s")
             console.print(f"Discover bounds: {'yes' if discover_bounds else 'no'}")
-            console.print(f"Database: {db_path}")
+            console.print(f"Database: {resolved_db_path}")
             console.print()
 
             pid = daemon.start(
                 year=year,
                 all_years=all_years,
                 rate_limit=rate_limit,
-                db_path=db_path,
+                db_path=resolved_db_path,
                 max_rate_limit_retries=max_rate_limit_retries,
                 cooldown_seconds=cooldown_seconds,
                 discover_bounds=discover_bounds,
@@ -1203,7 +1221,7 @@ def daemon_cmd(
             raise typer.Exit(1)
 
     elif action == "stop":
-        db = _open_database(db_path, read_only=True)
+        db = _open_database(resolved_db_path, read_only=True)
         daemon = ScraperDaemon(db)
         try:
             console.print("Stopping daemon...")
@@ -1226,21 +1244,22 @@ def daemon_worker(
     max_rate_limit_retries: int = typer.Option(4, "--max-rate-limit-retries"),
     cooldown_seconds: float = typer.Option(30.0, "--cooldown-seconds"),
     discover_bounds: bool = typer.Option(True, "--discover-bounds/--no-discover-bounds"),
-    db_path: str = typer.Option("data/mcf_jobs.db", "--db"),
+    db_path: Optional[str] = typer.Option(None, "--db"),
     pidfile: str = typer.Option("data/.scraper.pid", "--pidfile"),
     logfile: str = typer.Option("data/scraper_daemon.log", "--logfile"),
     heartbeat_interval: int = typer.Option(DEFAULT_HEARTBEAT_INTERVAL, "--heartbeat-interval"),
     wake_threshold: int = typer.Option(DEFAULT_WAKE_THRESHOLD, "--wake-threshold"),
 ) -> None:
     """Internal: daemon worker process. Do not call directly."""
-    db_target = resolve_database_target(db_path)
+    resolved_db_path = _resolve_daemon_db_path(db_path)
+    db_target = resolve_database_target(resolved_db_path)
     db_exists = db_target.is_postgres or db_target.sqlite_path.exists()
     try:
-        db = _open_database(db_path)
+        db = _open_database(resolved_db_path)
     except sqlite3.OperationalError as exc:
         if not db_exists or "locked" not in str(exc).lower():
             raise
-        db = _open_database(db_path, ensure_schema=False)
+        db = _open_database(resolved_db_path, ensure_schema=False)
     daemon = ScraperDaemon(
         db,
         pidfile=pidfile,
@@ -1251,7 +1270,7 @@ def daemon_worker(
 
     async def run_scraper():
         async with HistoricalScraper(
-            db_path=db_path,
+            db_path=resolved_db_path,
             requests_per_second=rate_limit,
             max_rate_limit_retries=max_rate_limit_retries,
             cooldown_seconds=cooldown_seconds,

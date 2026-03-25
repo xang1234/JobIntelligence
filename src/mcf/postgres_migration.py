@@ -11,8 +11,6 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-import numpy as np
-
 from .hosted_slice import HostedSlicePolicy
 from .pg_database import PostgresDatabase
 
@@ -33,6 +31,20 @@ SEQUENCE_RESET_TABLES = (
     "fetch_attempts",
     "search_analytics",
 )
+
+TIMESTAMP_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
+    "jobs": ("first_seen_at", "last_updated_at"),
+    "job_history": ("recorded_at",),
+    "scrape_sessions": ("started_at", "updated_at", "completed_at"),
+    "historical_scrape_progress": ("started_at", "updated_at", "completed_at"),
+    "fetch_attempts": ("attempted_at",),
+    "daemon_state": ("last_heartbeat", "started_at"),
+    "search_analytics": ("searched_at",),
+}
+
+BOOLEAN_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
+    "search_analytics": ("cache_hit", "degraded"),
+}
 
 
 @dataclass
@@ -74,6 +86,20 @@ def _is_iso_date(value: Any) -> bool:
     except ValueError:
         return False
     return len(raw) == 10
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def audit_sqlite_source(sqlite_path: str | Path) -> list[MigrationAnomaly]:
@@ -140,7 +166,77 @@ def _coerce_job_row(row: sqlite3.Row, report: MigrationReport) -> dict[str, Any]
                 )
             )
             coerced[column] = None
+    for column in TIMESTAMP_COLUMNS_BY_TABLE["jobs"]:
+        raw = coerced.get(column)
+        parsed = _parse_timestamp(raw)
+        if raw not in (None, "") and parsed is None:
+            report.anomalies.append(
+                MigrationAnomaly(
+                    table="jobs",
+                    row_id=str(coerced["uuid"]),
+                    column=column,
+                    raw_value=str(raw),
+                    issue="coerced_invalid_timestamp",
+                )
+            )
+        coerced[column] = parsed
     return coerced
+
+
+def _coerce_timestamp_fields(
+    table: str,
+    rows: Iterable[sqlite3.Row],
+    report: MigrationReport,
+    *,
+    row_identifier_column: str = "id",
+) -> list[dict[str, Any]]:
+    timestamp_columns = TIMESTAMP_COLUMNS_BY_TABLE.get(table, ())
+    if not timestamp_columns:
+        return [dict(row) for row in rows]
+
+    coerced_rows: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row)
+        row_id = str(payload.get(row_identifier_column, payload.get("uuid", "unknown")))
+        for column in timestamp_columns:
+            raw = payload.get(column)
+            parsed = _parse_timestamp(raw)
+            if raw not in (None, "") and parsed is None:
+                report.anomalies.append(
+                    MigrationAnomaly(
+                        table=table,
+                        row_id=row_id,
+                        column=column,
+                        raw_value=str(raw),
+                        issue="coerced_invalid_timestamp",
+                    )
+                )
+            payload[column] = parsed
+        for column in BOOLEAN_COLUMNS_BY_TABLE.get(table, ()):
+            raw = payload.get(column)
+            if raw is None or isinstance(raw, bool):
+                continue
+            if isinstance(raw, (int, float)):
+                payload[column] = bool(raw)
+                continue
+            lowered = str(raw).strip().lower()
+            if lowered in {"1", "true", "t", "yes", "y"}:
+                payload[column] = True
+            elif lowered in {"0", "false", "f", "no", "n", ""}:
+                payload[column] = False
+            else:
+                report.anomalies.append(
+                    MigrationAnomaly(
+                        table=table,
+                        row_id=row_id,
+                        column=column,
+                        raw_value=str(raw),
+                        issue="coerced_invalid_boolean",
+                    )
+                )
+                payload[column] = None
+        coerced_rows.append(payload)
+    return coerced_rows
 
 
 def _chunked(iterable: Iterable[Any], size: int) -> Iterable[list[Any]]:
@@ -186,6 +282,26 @@ def _reset_postgres_sequences(conn: Any, tables: Iterable[str] = SEQUENCE_RESET_
             conn.execute("SELECT setval(CAST(%s AS regclass), %s, true)", (sequence_name, max_id))
 
 
+def _executemany(conn: Any, query: str, params_seq: list[Any]) -> None:
+    """psycopg bulk insert helper using a cursor-level executemany."""
+    if not params_seq:
+        return
+    with conn.cursor() as cursor:
+        cursor.executemany(query, params_seq)
+
+
+def _sqlite_table_count(conn: sqlite3.Connection, table: str) -> int:
+    return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+def _postgres_table_count(conn: Any, table: str) -> int:
+    return int(conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()["count"])
+
+
+def _truncate_target_table(conn: Any, table: str) -> None:
+    conn.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE")
+
+
 def migrate_sqlite_backup_to_postgres(
     *,
     sqlite_path: str | Path,
@@ -201,47 +317,78 @@ def migrate_sqlite_backup_to_postgres(
     )
     source = _open_sqlite_source(sqlite_path)
     target = PostgresDatabase(postgres_dsn, read_only=False, ensure_schema=True)
+    source_counts = {table: _sqlite_table_count(source, table) for table in (*TABLE_COPY_ORDER, "embeddings")}
+    target_counts: dict[str, int] = {}
 
     try:
         if truncate_first:
             _truncate_postgres_target(target)
+        else:
+            with target._connection() as conn:
+                for table in source_counts:
+                    target_counts[table] = _postgres_table_count(conn, table)
 
-        with target._connection() as conn:
-            copied = 0
-            for chunk in _stream_sqlite_rows(source, "SELECT * FROM jobs ORDER BY id", fetch_size=batch_size):
-                for row in chunk:
-                    payload = _coerce_job_row(row, report)
-                    target._insert_job(conn, payload, payload.get("last_updated_at") or datetime.now().isoformat())
-                    copied += 1
-            report.copied_rows["jobs"] = copied
+        if not truncate_first and target_counts.get("jobs") == source_counts["jobs"]:
+            report.copied_rows["jobs"] = 0
+        else:
+            conn = target._connect(write_optimized=True)
+            try:
+                copied = 0
+                for chunk in _stream_sqlite_rows(source, "SELECT * FROM jobs ORDER BY id", fetch_size=batch_size):
+                    for row in chunk:
+                        payload = _coerce_job_row(row, report)
+                        target._insert_job(conn, payload, payload.get("last_updated_at") or datetime.now().isoformat())
+                        copied += 1
+                    conn.commit()
+                report.copied_rows["jobs"] = copied
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
-        with target._connection() as conn:
+        conn = target._connect(write_optimized=True)
+        try:
             copied = 0
-            for chunk in _stream_sqlite_rows(
-                source,
-                """
-                SELECT job_uuid, title, company_name, salary_min, salary_max,
-                       applications_count, description, recorded_at
-                FROM job_history ORDER BY id
-                """,
-                fetch_size=batch_size,
-            ):
-                conn.executemany(
+            if not truncate_first and target_counts.get("job_history") == source_counts["job_history"]:
+                report.copied_rows["job_history"] = 0
+            else:
+                if not truncate_first and target_counts.get("job_history", 0) > 0:
+                    _truncate_target_table(conn, "job_history")
+                    conn.commit()
+                for chunk in _stream_sqlite_rows(
+                    source,
                     """
-                    INSERT INTO job_history (
-                        job_uuid, title, company_name, salary_min, salary_max,
-                        applications_count, description, recorded_at
-                    ) VALUES (
-                        %(job_uuid)s, %(title)s, %(company_name)s, %(salary_min)s, %(salary_max)s,
-                        %(applications_count)s, %(description)s, %(recorded_at)s
-                    )
+                    SELECT job_uuid, title, company_name, salary_min, salary_max,
+                           applications_count, description, recorded_at
+                    FROM job_history ORDER BY id
                     """,
-                    [dict(row) for row in chunk],
-                )
-                copied += len(chunk)
-            report.copied_rows["job_history"] = copied
+                    fetch_size=batch_size,
+                ):
+                    _executemany(
+                        conn,
+                        """
+                        INSERT INTO job_history (
+                            job_uuid, title, company_name, salary_min, salary_max,
+                            applications_count, description, recorded_at
+                        ) VALUES (
+                            %(job_uuid)s, %(title)s, %(company_name)s, %(salary_min)s, %(salary_max)s,
+                            %(applications_count)s, %(description)s, %(recorded_at)s
+                        )
+                        """,
+                        _coerce_timestamp_fields("job_history", chunk, report, row_identifier_column="job_uuid"),
+                    )
+                    copied += len(chunk)
+                    conn.commit()
+                report.copied_rows["job_history"] = copied
 
             for table in ("scrape_sessions", "historical_scrape_progress", "fetch_attempts", "search_analytics"):
+                if not truncate_first and target_counts.get(table) == source_counts[table]:
+                    report.copied_rows[table] = 0
+                    continue
+                if not truncate_first and target_counts.get(table, 0) > 0:
+                    _truncate_target_table(conn, table)
+                    conn.commit()
                 copied = 0
                 column_list: str | None = None
                 value_list: str | None = None
@@ -250,57 +397,85 @@ def migrate_sqlite_backup_to_postgres(
                         columns = chunk[0].keys()
                         column_list = ", ".join(columns)
                         value_list = ", ".join(f"%({column})s" for column in columns)
-                    conn.executemany(
+                    payloads = _coerce_timestamp_fields(table, chunk, report)
+                    _executemany(
+                        conn,
                         f"INSERT INTO {table} ({column_list}) VALUES ({value_list})",
-                        [dict(row) for row in chunk],
+                        payloads,
                     )
                     copied += len(chunk)
+                    conn.commit()
                 report.copied_rows[table] = copied
 
             daemon_rows: list[dict[str, Any]] = []
-            for chunk in _stream_sqlite_rows(source, "SELECT * FROM daemon_state", fetch_size=batch_size):
-                daemon_rows.extend(dict(row) for row in chunk)
-            if daemon_rows:
-                conn.execute("DELETE FROM daemon_state")
-                conn.executemany(
-                    """
-                    INSERT INTO daemon_state (id, pid, status, last_heartbeat, started_at, current_year, current_seq)
-                    VALUES (%(id)s, %(pid)s, %(status)s, %(last_heartbeat)s, %(started_at)s, %(current_year)s, %(current_seq)s)
-                    """,
-                    daemon_rows,
-                )
-            report.copied_rows["daemon_state"] = len(daemon_rows)
-            _reset_postgres_sequences(conn)
-
-        with target._connection() as conn:
-            copied = 0
-            for chunk in _stream_sqlite_rows(
-                source,
-                "SELECT entity_id, entity_type, embedding_blob, model_version FROM embeddings ORDER BY id",
-                fetch_size=batch_size,
-            ):
-                payloads = [
-                    (
-                        row["entity_id"],
-                        row["entity_type"],
-                        PostgresDatabase._vector_literal(np.frombuffer(row["embedding_blob"], dtype=np.float32)),
-                        row["model_version"],
+            if not truncate_first and target_counts.get("daemon_state") == source_counts["daemon_state"]:
+                report.copied_rows["daemon_state"] = 0
+            else:
+                for chunk in _stream_sqlite_rows(source, "SELECT * FROM daemon_state", fetch_size=batch_size):
+                    daemon_rows.extend(_coerce_timestamp_fields("daemon_state", chunk, report))
+                if daemon_rows:
+                    conn.execute("DELETE FROM daemon_state")
+                    _executemany(
+                        conn,
+                        """
+                        INSERT INTO daemon_state (id, pid, status, last_heartbeat, started_at, current_year, current_seq)
+                        VALUES (%(id)s, %(pid)s, %(status)s, %(last_heartbeat)s, %(started_at)s, %(current_year)s, %(current_seq)s)
+                        """,
+                        daemon_rows,
                     )
-                    for row in chunk
-                ]
-                conn.executemany(
-                    """
-                    INSERT INTO embeddings (entity_id, entity_type, embedding, model_version, updated_at)
-                    VALUES (%s, %s, %s::vector, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (entity_id, entity_type) DO UPDATE SET
-                        embedding = EXCLUDED.embedding,
-                        model_version = EXCLUDED.model_version,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    payloads,
-                )
-                copied += len(payloads)
-            report.copied_rows["embeddings"] = copied
+                report.copied_rows["daemon_state"] = len(daemon_rows)
+            _reset_postgres_sequences(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        if not truncate_first and target_counts.get("embeddings") == source_counts["embeddings"]:
+            report.copied_rows["embeddings"] = 0
+        else:
+            conn = target._connect(write_optimized=True)
+            try:
+                if not truncate_first and target_counts.get("embeddings", 0) > 0:
+                    _truncate_target_table(conn, "embeddings")
+                    conn.commit()
+                copied = 0
+                embedding_placeholder = target._embedding_placeholder()
+                for chunk in _stream_sqlite_rows(
+                    source,
+                    "SELECT entity_id, entity_type, embedding_blob, model_version FROM embeddings ORDER BY id",
+                    fetch_size=batch_size,
+                ):
+                    payloads = [
+                        (
+                            row["entity_id"],
+                            row["entity_type"],
+                            target._embedding_parameter(row["embedding_blob"]),
+                            row["model_version"],
+                        )
+                        for row in chunk
+                    ]
+                    _executemany(
+                        conn,
+                        f"""
+                        INSERT INTO embeddings (entity_id, entity_type, embedding, model_version, updated_at)
+                        VALUES (%s, %s, {embedding_placeholder}, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (entity_id, entity_type) DO UPDATE SET
+                            embedding = EXCLUDED.embedding,
+                            model_version = EXCLUDED.model_version,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        payloads,
+                    )
+                    copied += len(payloads)
+                    conn.commit()
+                report.copied_rows["embeddings"] = copied
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
         report.finished_at = datetime.now().isoformat()
         return report
@@ -353,18 +528,20 @@ def seed_hosted_slice_from_postgres(
 
     with source._connection() as source_conn:
         embeddings = source_conn.execute(
-            """
-            SELECT entity_id, embedding::text AS embedding, model_version
+            f"""
+            SELECT entity_id, {source._embedding_select_clause()}, model_version
             FROM embeddings
             WHERE entity_type = 'job' AND entity_id = ANY(%s)
             """,
             (job_ids,),
         ).fetchall()
     with target._connection() as conn:
-        conn.executemany(
-            """
+        embedding_placeholder = target._embedding_placeholder()
+        _executemany(
+            conn,
+            f"""
             INSERT INTO embeddings (entity_id, entity_type, embedding, model_version, updated_at)
-            VALUES (%s, 'job', %s::vector, %s, CURRENT_TIMESTAMP)
+            VALUES (%s, 'job', {embedding_placeholder}, %s, CURRENT_TIMESTAMP)
             ON CONFLICT (entity_id, entity_type) DO UPDATE SET
                 embedding = EXCLUDED.embedding,
                 model_version = EXCLUDED.model_version,
@@ -373,7 +550,7 @@ def seed_hosted_slice_from_postgres(
             [
                 (
                     row["entity_id"],
-                    PostgresDatabase._vector_literal(PostgresDatabase._vector_from_value(row["embedding"])),
+                    target._embedding_parameter(PostgresDatabase._vector_from_value(row["embedding"])),
                     row["model_version"],
                 )
                 for row in embeddings

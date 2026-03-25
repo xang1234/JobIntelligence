@@ -76,19 +76,23 @@ poetry run python -m src.cli pg-migrate \
   --source data/backups/mcf_pre_postgres_20260324T191812.db \
   --target postgresql://postgres:postgres@localhost:5432/mcf
 
-# 3. Serve locally from Postgres with pgvector.
+# 3. Serve locally from Postgres.
+#    If local pgvector is unavailable, embeddings are stored as BYTEA and FAISS remains the local vector path.
 poetry run python -m src.cli api-serve \
   --db postgresql://postgres:postgres@localhost:5432/mcf \
-  --search-backend pgvector
+  --search-backend faiss
 
-# 4. Seed and maintain a lean hosted slice (2026 + last 90 days, job vectors only).
+# 4. Persist the local Postgres target so plain daemon commands default to it.
+printf '%s\n' 'postgresql://postgres@127.0.0.1:55432/mcf' > data/default_db_target.txt
+
+# 5. Seed and maintain a lean hosted slice (2026 + last 90 days, job vectors only).
 poetry run python -m src.cli pg-seed-hosted \
   --source postgresql://postgres:postgres@localhost:5432/mcf \
   --target postgresql://<neon-dsn>
 poetry run python -m src.cli pg-purge-hosted --target postgresql://<neon-dsn>
 ```
 
-The hosted slice intentionally excludes skill and company embeddings. Local Postgres keeps the full archive, while FAISS remains available for local/offline search during the transition.
+The hosted slice intentionally excludes skill and company embeddings. Local Postgres keeps the full archive, while FAISS remains available for local/offline search during the transition. The daemon now checks `data/default_db_target.txt` when `--db` is omitted, so a migrated local Postgres DSN can become the default without requiring shell exports.
 
 ## Architecture
 

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 
-from src.mcf.postgres_migration import _reset_postgres_sequences, _stream_sqlite_rows
+from src.mcf.postgres_migration import (
+    MigrationReport,
+    _coerce_timestamp_fields,
+    _reset_postgres_sequences,
+    _stream_sqlite_rows,
+)
 
 
 def test_stream_sqlite_rows_batches_without_fetchall():
@@ -51,3 +57,31 @@ def test_reset_postgres_sequences_uses_max_id_and_empty_table_defaults():
         ("SELECT setval(CAST(%s AS regclass), %s, true)", ("public.scrape_sessions_id_seq", 12)),
         ("SELECT setval(CAST(%s AS regclass), %s, false)", ("public.search_analytics_id_seq", 1)),
     ]
+
+
+def test_coerce_timestamp_fields_replaces_invalid_values_with_none():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE search_analytics (id INTEGER PRIMARY KEY, searched_at TEXT, cache_hit INTEGER, degraded TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO search_analytics (id, searched_at, cache_hit, degraded) "
+        "VALUES (1, '2026-03-24T12:34:56', 1, 'false')"
+    )
+    conn.execute(
+        "INSERT INTO search_analytics (id, searched_at, cache_hit, degraded) "
+        "VALUES (2, 'bad-timestamp', 0, 'true')"
+    )
+    rows = conn.execute("SELECT * FROM search_analytics ORDER BY id").fetchall()
+
+    report = MigrationReport(source="sqlite", target="postgres", started_at=datetime.now().isoformat())
+    payloads = _coerce_timestamp_fields("search_analytics", rows, report)
+
+    assert payloads[0]["searched_at"] == datetime.fromisoformat("2026-03-24T12:34:56")
+    assert payloads[0]["cache_hit"] is True
+    assert payloads[0]["degraded"] is False
+    assert payloads[1]["searched_at"] is None
+    assert payloads[1]["cache_hit"] is False
+    assert payloads[1]["degraded"] is True
+    assert report.anomalies[-1].issue == "coerced_invalid_timestamp"

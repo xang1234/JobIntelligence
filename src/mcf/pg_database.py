@@ -21,8 +21,12 @@ from .models import Job
 logger = logging.getLogger(__name__)
 
 
+EMBEDDING_VECTOR_STORAGE = "vector"
+EMBEDDING_BINARY_STORAGE = "bytea"
+
+
 PG_SCHEMA_SQL = """
-CREATE EXTENSION IF NOT EXISTS vector;
+{vector_extension_sql}
 
 CREATE TABLE IF NOT EXISTS jobs (
     id BIGSERIAL PRIMARY KEY,
@@ -123,7 +127,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
     id BIGSERIAL PRIMARY KEY,
     entity_id TEXT NOT NULL,
     entity_type TEXT NOT NULL,
-    embedding vector(384) NOT NULL,
+    embedding {embedding_column_type} NOT NULL,
     model_version TEXT DEFAULT 'all-MiniLM-L6-v2',
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -164,6 +168,19 @@ CREATE INDEX IF NOT EXISTS idx_embeddings_type ON embeddings(entity_type);
 CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model_version);
 CREATE INDEX IF NOT EXISTS idx_analytics_time ON search_analytics(searched_at);
 CREATE INDEX IF NOT EXISTS idx_analytics_query ON search_analytics(query);
+{embedding_vector_indexes}
+"""
+
+
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def build_pg_schema_sql(*, pgvector_enabled: bool) -> str:
+    """Build the PostgreSQL schema for vector or bytea embedding storage."""
+    if pgvector_enabled:
+        vector_extension_sql = "CREATE EXTENSION IF NOT EXISTS vector;"
+        embedding_column_type = "vector(384)"
+        embedding_vector_indexes = """
 CREATE INDEX IF NOT EXISTS idx_embeddings_job_vector
     ON embeddings USING hnsw (embedding vector_cosine_ops)
     WHERE entity_type = 'job';
@@ -172,11 +189,17 @@ CREATE INDEX IF NOT EXISTS idx_embeddings_skill_vector
     WHERE entity_type = 'skill';
 CREATE INDEX IF NOT EXISTS idx_embeddings_company_vector
     ON embeddings USING hnsw (embedding vector_cosine_ops)
-    WHERE entity_type = 'company';
-"""
+    WHERE entity_type = 'company';"""
+    else:
+        vector_extension_sql = "-- pgvector extension not available; embeddings will be stored as BYTEA."
+        embedding_column_type = "BYTEA"
+        embedding_vector_indexes = ""
 
-
-ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    return PG_SCHEMA_SQL.format(
+        vector_extension_sql=vector_extension_sql,
+        embedding_column_type=embedding_column_type,
+        embedding_vector_indexes=embedding_vector_indexes,
+    )
 
 
 class PostgresDatabase:
@@ -191,6 +214,7 @@ class PostgresDatabase:
         self.dsn = dsn
         self.read_only = read_only
         self.ensure_schema = ensure_schema
+        self.embedding_storage_kind: str | None = None
         if ensure_schema and not read_only:
             self._ensure_schema()
 
@@ -222,9 +246,87 @@ class PostgresDatabase:
         finally:
             conn.close()
 
+    def _pgvector_extension_available(self, conn: Any | None = None) -> bool:
+        owns_connection = conn is None
+        if conn is None:
+            conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 AS available FROM pg_available_extensions WHERE name = 'vector'"
+            ).fetchone()
+            return bool(row)
+        finally:
+            if owns_connection:
+                conn.close()
+
+    def _refresh_embedding_storage_kind(self, conn: Any | None = None) -> str:
+        owns_connection = conn is None
+        if conn is None:
+            conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT udt_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'embeddings'
+                  AND column_name = 'embedding'
+                """
+            ).fetchone()
+            if row and row["udt_name"] == "vector":
+                self.embedding_storage_kind = EMBEDDING_VECTOR_STORAGE
+            elif row:
+                self.embedding_storage_kind = EMBEDDING_BINARY_STORAGE
+            else:
+                self.embedding_storage_kind = (
+                    EMBEDDING_VECTOR_STORAGE if self._pgvector_extension_available(conn) else EMBEDDING_BINARY_STORAGE
+                )
+            return self.embedding_storage_kind
+        finally:
+            if owns_connection:
+                conn.close()
+
+    def _using_pgvector(self) -> bool:
+        if self.embedding_storage_kind not in {EMBEDDING_VECTOR_STORAGE, EMBEDDING_BINARY_STORAGE}:
+            self._refresh_embedding_storage_kind()
+        return self.embedding_storage_kind == EMBEDDING_VECTOR_STORAGE
+
+    def _embedding_select_clause(self, column: str = "embedding", alias: str = "embedding") -> str:
+        expression = f"{column}::text" if self._using_pgvector() else column
+        return f"{expression} AS {alias}"
+
+    def _embedding_placeholder(self) -> str:
+        return "%s::vector" if self._using_pgvector() else "%s"
+
+    @staticmethod
+    def _embedding_bytes(embedding: np.ndarray) -> bytes:
+        return np.asarray(embedding, dtype=np.float32).tobytes()
+
+    def _embedding_parameter(self, embedding: np.ndarray | bytes | bytearray | memoryview) -> Any:
+        if self._using_pgvector():
+            return self._vector_literal(self._vector_from_value(embedding))
+        if isinstance(embedding, memoryview):
+            return embedding.tobytes()
+        if isinstance(embedding, bytearray):
+            return bytes(embedding)
+        if isinstance(embedding, bytes):
+            return embedding
+        return self._embedding_bytes(embedding)
+
+    @staticmethod
+    def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
+        denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
+        if denominator == 0.0:
+            return 0.0
+        return float(np.dot(left, right) / denominator)
+
     def _ensure_schema(self) -> None:
         with self._connection() as conn:
-            conn.execute(PG_SCHEMA_SQL)
+            pgvector_enabled = self._pgvector_extension_available(conn)
+            if not pgvector_enabled:
+                logger.warning("pgvector extension is not installed; falling back to BYTEA embedding storage")
+            conn.execute(build_pg_schema_sql(pgvector_enabled=pgvector_enabled))
+            self._refresh_embedding_storage_kind(conn)
 
     @staticmethod
     def _parse_date(value: str | None) -> date | None:
@@ -248,6 +350,10 @@ class PostgresDatabase:
             raise ValueError("cannot decode null vector")
         if isinstance(value, list):
             return np.asarray(value, dtype=np.float32)
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, (bytes, bytearray)):
+            return np.frombuffer(value, dtype=np.float32).copy()
         raw = str(value).strip()
         if raw.startswith("[") and raw.endswith("]"):
             raw = raw[1:-1]
@@ -266,6 +372,13 @@ class PostgresDatabase:
     @staticmethod
     def _placeholder_list(size: int) -> str:
         return ",".join(["%s"] * size)
+
+    @staticmethod
+    def _executemany(conn: Any, query: str, params_seq: list[Any] | tuple[Any, ...]) -> None:
+        if not params_seq:
+            return
+        with conn.cursor() as cursor:
+            cursor.executemany(query, params_seq)
 
     @staticmethod
     def can_acquire_write_lock(db_path: str, timeout_ms: int = 1000) -> bool:
@@ -446,7 +559,8 @@ class PostgresDatabase:
                     )
                     updates.append((title_family, industry_bucket, row["uuid"]))
                 if updates:
-                    conn.executemany(
+                    self._executemany(
+                        conn,
                         "UPDATE jobs SET title_family = %s, industry_bucket = %s WHERE uuid = %s",
                         updates,
                     )
@@ -859,7 +973,8 @@ class PostgresDatabase:
         if conn is None:
             conn = self._connect(write_optimized=True)
         try:
-            conn.executemany(
+            self._executemany(
+                conn,
                 """
                 INSERT INTO fetch_attempts (year, sequence, result, error_message, attempted_at)
                 VALUES (%(year)s, %(sequence)s, %(result)s, %(error_message)s, CURRENT_TIMESTAMP)
@@ -1039,24 +1154,25 @@ class PostgresDatabase:
         model_version: str | None = None,
     ) -> None:
         model = model_version or "all-MiniLM-L6-v2"
-        literal = self._vector_literal(embedding)
+        placeholder = self._embedding_placeholder()
+        value = self._embedding_parameter(embedding)
         with self._connection() as conn:
             conn.execute(
-                """
+                f"""
                 INSERT INTO embeddings (entity_id, entity_type, embedding, model_version, updated_at)
-                VALUES (%s, %s, %s::vector, %s, CURRENT_TIMESTAMP)
+                VALUES (%s, %s, {placeholder}, %s, CURRENT_TIMESTAMP)
                 ON CONFLICT (entity_id, entity_type) DO UPDATE SET
                     embedding = EXCLUDED.embedding,
                     model_version = EXCLUDED.model_version,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (entity_id, entity_type, literal, model),
+                (entity_id, entity_type, value, model),
             )
 
     def get_embedding(self, entity_id: str, entity_type: str) -> Optional[np.ndarray]:
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT embedding::text AS embedding FROM embeddings WHERE entity_id = %s AND entity_type = %s",
+                f"SELECT {self._embedding_select_clause()} FROM embeddings WHERE entity_id = %s AND entity_type = %s",
                 (entity_id, entity_type),
             ).fetchone()
         return self._vector_from_value(row["embedding"]) if row else None
@@ -1069,8 +1185,8 @@ class PostgresDatabase:
         with self._connection() as conn:
             if model_version is None:
                 rows = conn.execute(
-                    """
-                    SELECT entity_id, embedding::text AS embedding
+                    f"""
+                    SELECT entity_id, {self._embedding_select_clause()}
                     FROM embeddings
                     WHERE entity_type = %s
                     ORDER BY id
@@ -1079,8 +1195,8 @@ class PostgresDatabase:
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """
-                    SELECT entity_id, embedding::text AS embedding
+                    f"""
+                    SELECT entity_id, {self._embedding_select_clause()}
                     FROM embeddings
                     WHERE entity_type = %s AND model_version = %s
                     ORDER BY id
@@ -1103,8 +1219,8 @@ class PostgresDatabase:
         with self._connection() as conn:
             if model_version is None:
                 rows = conn.execute(
-                    """
-                    SELECT entity_id, embedding::text AS embedding
+                    f"""
+                    SELECT entity_id, {self._embedding_select_clause()}
                     FROM embeddings
                     WHERE entity_type = 'job' AND entity_id = ANY(%s)
                     """,
@@ -1112,8 +1228,8 @@ class PostgresDatabase:
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """
-                    SELECT entity_id, embedding::text AS embedding
+                    f"""
+                    SELECT entity_id, {self._embedding_select_clause()}
                     FROM embeddings
                     WHERE entity_type = 'job' AND entity_id = ANY(%s) AND model_version = %s
                     """,
@@ -1155,18 +1271,19 @@ class PostgresDatabase:
         if len(entity_ids) != len(embeddings):
             raise ValueError("entity_ids and embeddings must have same length")
         model = model_version or "all-MiniLM-L6-v2"
+        placeholder = self._embedding_placeholder()
         with self._connection() as conn:
             for entity_id, embedding in zip(entity_ids, embeddings):
                 conn.execute(
-                    """
+                    f"""
                     INSERT INTO embeddings (entity_id, entity_type, embedding, model_version, updated_at)
-                    VALUES (%s, %s, %s::vector, %s, CURRENT_TIMESTAMP)
+                    VALUES (%s, %s, {placeholder}, %s, CURRENT_TIMESTAMP)
                     ON CONFLICT (entity_id, entity_type) DO UPDATE SET
                         embedding = EXCLUDED.embedding,
                         model_version = EXCLUDED.model_version,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    (entity_id, entity_type, self._vector_literal(embedding), model),
+                    (entity_id, entity_type, self._embedding_parameter(embedding), model),
                 )
         return len(entity_ids)
 
@@ -1691,8 +1808,8 @@ class PostgresDatabase:
     def get_company_job_embeddings_bulk(self) -> dict[str, list[np.ndarray]]:
         with self._connection() as conn:
             rows = conn.execute(
-                """
-                SELECT j.company_name, e.embedding::text AS embedding
+                f"""
+                SELECT j.company_name, {self._embedding_select_clause(column='e.embedding')}
                 FROM jobs j
                 JOIN embeddings e ON e.entity_id = j.uuid AND e.entity_type = 'job'
                 WHERE j.company_name IS NOT NULL AND j.company_name != ''
@@ -1757,7 +1874,9 @@ class PostgresDatabase:
         entity_ids: list[str] | None = None,
         prefix: str | None = None,
     ) -> list[tuple[str, float]]:
-        literal = self._vector_literal(query_embedding)
+        if self._using_pgvector():
+            literal = self._vector_literal(query_embedding)
+        normalized_query = np.asarray(query_embedding, dtype=np.float32)
         params: list[Any] = [entity_type]
         conditions = ["entity_type = %s"]
         if model_version is not None:
@@ -1769,16 +1888,31 @@ class PostgresDatabase:
         if prefix is not None:
             conditions.append("entity_id LIKE %s")
             params.append(f"{prefix}%")
-        params.extend([literal, limit])
         with self._connection() as conn:
+            if self._using_pgvector():
+                rows = conn.execute(
+                    f"""
+                    SELECT entity_id, 1 - (embedding <=> %s::vector) AS score
+                    FROM embeddings
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    [literal, *params, literal, limit],
+                ).fetchall()
+                return [(row["entity_id"], float(row["score"])) for row in rows]
+
             rows = conn.execute(
                 f"""
-                SELECT entity_id, 1 - (embedding <=> %s::vector) AS score
+                SELECT entity_id, {self._embedding_select_clause()}
                 FROM embeddings
                 WHERE {' AND '.join(conditions)}
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
                 """,
-                [literal, *params],
+                params,
             ).fetchall()
-        return [(row["entity_id"], float(row["score"])) for row in rows]
+        scored = [
+            (row["entity_id"], self._cosine_similarity(self._vector_from_value(row["embedding"]), normalized_query))
+            for row in rows
+        ]
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored[:limit]

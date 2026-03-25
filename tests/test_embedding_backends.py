@@ -18,6 +18,7 @@ from src.mcf.embeddings.backends import (
 from src.mcf.embeddings.generator import EmbeddingGenerator
 from src.mcf.embeddings.pgvector_backend import PGVectorBackend
 from src.mcf.embeddings.search_engine import SemanticSearchEngine
+from src.mcf.pg_database import PostgresDatabase, build_pg_schema_sql
 from tests.factories import generate_test_job
 
 
@@ -163,3 +164,20 @@ def test_pgvector_backend_requires_job_embeddings():
 def test_create_app_fails_fast_for_missing_onnx_model_dir():
     with pytest.raises(FileNotFoundError):
         create_app(embedding_backend="onnx", onnx_model_dir="/tmp/does-not-exist")
+
+
+def test_postgres_database_decodes_bytea_embeddings():
+    vector = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+
+    decoded = PostgresDatabase._vector_from_value(vector.tobytes())
+
+    assert np.allclose(decoded, vector)
+    assert decoded.dtype == np.float32
+
+
+def test_build_pg_schema_sql_falls_back_to_bytea_without_pgvector():
+    schema = build_pg_schema_sql(pgvector_enabled=False)
+
+    assert "embedding BYTEA NOT NULL" in schema
+    assert "CREATE EXTENSION IF NOT EXISTS vector" not in schema
+    assert "vector_cosine_ops" not in schema

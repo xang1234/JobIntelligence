@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 POSTGRES_SCHEMES = ("postgres://", "postgresql://")
+DEFAULT_DATABASE_TARGET_FILE = Path("data/default_db_target.txt")
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,32 @@ def is_postgres_dsn(value: str | None) -> bool:
     return lowered.startswith(POSTGRES_SCHEMES)
 
 
+def resolve_database_value_from_env() -> str | None:
+    """Resolve a database target string from the supported environment variables."""
+    for env_var in ("DATABASE_URL", "MCF_DATABASE_URL", "MCF_DB_PATH"):
+        value = os.environ.get(env_var)
+        if value:
+            return value
+    return None
+
+
+def read_persisted_database_target(path: str | Path = DEFAULT_DATABASE_TARGET_FILE) -> str | None:
+    """Read a persisted default database target, if one has been configured."""
+    target_path = Path(path)
+    if not target_path.exists():
+        return None
+    value = target_path.read_text().strip()
+    return value or None
+
+
+def write_persisted_database_target(value: str, path: str | Path = DEFAULT_DATABASE_TARGET_FILE) -> Path:
+    """Persist a default database target for commands that opt into it."""
+    target_path = Path(path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(value.strip() + "\n")
+    return target_path
+
+
 def resolve_database_value(explicit_value: str | None = None) -> str:
     """
     Resolve a database target string from explicit args or environment.
@@ -65,10 +92,9 @@ def resolve_database_value(explicit_value: str | None = None) -> str:
     if explicit_value:
         return explicit_value
 
-    for env_var in ("DATABASE_URL", "MCF_DATABASE_URL", "MCF_DB_PATH"):
-        value = os.environ.get(env_var)
-        if value:
-            return value
+    env_value = resolve_database_value_from_env()
+    if env_value:
+        return env_value
 
     return "data/mcf_jobs.db"
 
