@@ -39,15 +39,22 @@ env/
 
 # Data files
 data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.db-journal
 data/*.csv
 data/*.json
 data/*.log
 data/.scraper.pid
+data/default_db_target.txt
+data/postgres/
+data/onnx_parity_*/
 data/scrape_jsons/*json
 data/embeddings/
 data/backups/*.db
 data/backups/*.db-shm
 data/backups/*.db-wal
+data/backups/postgres_migration_report*.json
 !data/backups/*.metadata.json
 
 # Pickle / binary artifacts
