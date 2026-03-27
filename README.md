@@ -94,6 +94,8 @@ poetry run python -m src.cli pg-purge-hosted --target postgresql://<neon-dsn>
 
 The hosted slice intentionally excludes skill and company embeddings. Local Postgres keeps the full archive, while FAISS remains available for local/offline search during the transition. The daemon now checks `data/default_db_target.txt` when `--db` is omitted, so a migrated local Postgres DSN can become the default without requiring shell exports.
 
+For the full hosted deployment recipe, see [docs/neon-oracle-hosted-deploy.md](docs/neon-oracle-hosted-deploy.md). That guide covers Neon Free for Postgres, GitHub Actions for scheduled hosted refreshes, and Oracle Cloud Always Free for the API container.
+
 ## Architecture
 
 ```

@@ -7,6 +7,7 @@ from src.mcf.postgres_migration import (
     MigrationReport,
     _coerce_timestamp_fields,
     _reset_postgres_sequences,
+    _select_hosted_resume_progress_rows,
     _should_skip_resume_copy,
     _stream_sqlite_rows,
 )
@@ -91,3 +92,63 @@ def test_coerce_timestamp_fields_replaces_invalid_values_with_none():
 def test_resume_never_skips_daemon_state_even_when_counts_match():
     assert _should_skip_resume_copy("jobs", source_count=10, target_count=10) is True
     assert _should_skip_resume_copy("daemon_state", source_count=1, target_count=1) is False
+
+
+def test_select_hosted_resume_progress_rows_keeps_latest_in_progress_for_hosted_year():
+    rows = [
+        {
+            "id": 1,
+            "year": 2026,
+            "status": "completed",
+            "current_seq": 100,
+            "started_at": "2026-03-01T00:00:00",
+            "updated_at": "2026-03-01T00:10:00",
+        },
+        {
+            "id": 2,
+            "year": 2025,
+            "status": "in_progress",
+            "current_seq": 999,
+            "started_at": "2026-03-02T00:00:00",
+            "updated_at": "2026-03-02T00:10:00",
+        },
+        {
+            "id": 3,
+            "year": 2026,
+            "status": "in_progress",
+            "current_seq": 150,
+            "started_at": "2026-03-03T00:00:00",
+            "updated_at": "2026-03-03T00:10:00",
+        },
+        {
+            "id": 4,
+            "year": 2026,
+            "status": "in_progress",
+            "current_seq": 200,
+            "started_at": "2026-03-04T00:00:00",
+            "updated_at": "2026-03-04T00:10:00",
+        },
+    ]
+
+    selected = _select_hosted_resume_progress_rows(rows, year=2026)
+
+    assert len(selected) == 1
+    assert selected[0]["year"] == 2026
+    assert selected[0]["status"] == "in_progress"
+    assert selected[0]["current_seq"] == 200
+    assert "id" not in selected[0]
+
+
+def test_select_hosted_resume_progress_rows_returns_empty_when_no_in_progress_row_exists():
+    rows = [
+        {
+            "id": 1,
+            "year": 2026,
+            "status": "completed",
+            "current_seq": 100,
+            "started_at": "2026-03-01T00:00:00",
+            "updated_at": "2026-03-01T00:10:00",
+        }
+    ]
+
+    assert _select_hosted_resume_progress_rows(rows, year=2026) == []

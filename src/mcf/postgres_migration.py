@@ -14,7 +14,6 @@ from typing import Any, Iterable
 from .hosted_slice import HostedSlicePolicy
 from .pg_database import PostgresDatabase
 
-
 TABLE_COPY_ORDER = [
     "jobs",
     "job_history",
@@ -290,6 +289,37 @@ def _executemany(conn: Any, query: str, params_seq: list[Any]) -> None:
         cursor.executemany(query, params_seq)
 
 
+def _select_hosted_resume_progress_rows(rows: Iterable[dict[str, Any]], *, year: int) -> list[dict[str, Any]]:
+    """
+    Keep only the newest in-progress historical session for the hosted year.
+
+    Hosted refreshes use ``scrape-historical --resume``. They do not need the
+    full local progress history, but preserving one resumable row avoids
+    restarting the hosted 2026 scan from sequence 1 after the initial seed.
+    """
+
+    selected: dict[str, Any] | None = None
+    selected_key: tuple[datetime, int, int] | None = None
+
+    for raw_row in rows:
+        row = dict(raw_row)
+        if int(row.get("year") or 0) != year or row.get("status") != "in_progress":
+            continue
+        updated_at = _parse_timestamp(row.get("updated_at")) or _parse_timestamp(row.get("started_at")) or datetime.min
+        current_seq = int(row.get("current_seq") or 0)
+        row_id = int(row.get("id") or 0)
+        row_key = (updated_at, current_seq, row_id)
+        if selected_key is None or row_key > selected_key:
+            selected = row
+            selected_key = row_key
+
+    if selected is None:
+        return []
+
+    selected.pop("id", None)
+    return [selected]
+
+
 def _sqlite_table_count(conn: sqlite3.Connection, table: str) -> int:
     return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
@@ -439,8 +469,13 @@ def migrate_sqlite_backup_to_postgres(
                 _executemany(
                     conn,
                     """
-                    INSERT INTO daemon_state (id, pid, status, last_heartbeat, started_at, current_year, current_seq)
-                    VALUES (%(id)s, %(pid)s, %(status)s, %(last_heartbeat)s, %(started_at)s, %(current_year)s, %(current_seq)s)
+                    INSERT INTO daemon_state (
+                        id, pid, status, last_heartbeat, started_at, current_year, current_seq
+                    )
+                    VALUES (
+                        %(id)s, %(pid)s, %(status)s, %(last_heartbeat)s,
+                        %(started_at)s, %(current_year)s, %(current_seq)s
+                    )
                     """,
                     daemon_rows,
                 )
@@ -531,6 +566,7 @@ def seed_hosted_slice_from_postgres(
     source = PostgresDatabase(source_dsn, read_only=True, ensure_schema=False)
     target = PostgresDatabase(target_dsn, read_only=False, ensure_schema=True)
     cutoff = policy.cutoff_date()
+    hosted_year = policy.min_posted_date.year
     _truncate_postgres_target(target)
 
     with source._connection() as source_conn, target._connection() as target_conn:
@@ -545,6 +581,52 @@ def seed_hosted_slice_from_postgres(
         ).fetchall()
         for row in jobs:
             target._insert_job(target_conn, dict(row), row.get("last_updated_at") or datetime.now().isoformat())
+
+        progress_rows = _select_hosted_resume_progress_rows(
+            source_conn.execute(
+                """
+                SELECT * FROM historical_scrape_progress
+                WHERE year = %s
+                ORDER BY COALESCE(updated_at, started_at) DESC NULLS LAST, id DESC
+                """,
+                (hosted_year,),
+            ).fetchall(),
+            year=hosted_year,
+        )
+        _executemany(
+            target_conn,
+            """
+            INSERT INTO historical_scrape_progress (
+                year,
+                start_seq,
+                current_seq,
+                end_seq,
+                jobs_found,
+                jobs_not_found,
+                consecutive_not_found,
+                status,
+                started_at,
+                updated_at,
+                completed_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            [
+                (
+                    row["year"],
+                    row["start_seq"],
+                    row["current_seq"],
+                    row.get("end_seq"),
+                    row.get("jobs_found", 0),
+                    row.get("jobs_not_found", 0),
+                    row.get("consecutive_not_found", 0),
+                    row.get("status", "in_progress"),
+                    row.get("started_at"),
+                    row.get("updated_at"),
+                    row.get("completed_at"),
+                )
+                for row in progress_rows
+            ],
+        )
 
     job_ids = []
     with target._connection() as conn:
@@ -585,6 +667,7 @@ def seed_hosted_slice_from_postgres(
     purge_counts = purge_hosted_slice(target_dsn=target_dsn, policy=policy)
     purge_counts["seeded_jobs"] = len(job_ids)
     purge_counts["seeded_job_embeddings"] = len(embeddings)
+    purge_counts["seeded_historical_sessions"] = len(progress_rows)
     return purge_counts
 
 
@@ -594,10 +677,15 @@ def purge_hosted_slice(*, target_dsn: str, policy: HostedSlicePolicy) -> dict[st
     """
     target = PostgresDatabase(target_dsn, read_only=False, ensure_schema=True)
     cutoff = policy.cutoff_date()
+    hosted_year = policy.min_posted_date.year
     with target._connection() as conn:
         company_deleted = conn.execute(
             "DELETE FROM embeddings WHERE entity_type IN ('skill', 'company') RETURNING 1"
         ).fetchall()
+        history_deleted = conn.execute("DELETE FROM job_history RETURNING 1").fetchall()
+        scrape_session_deleted = conn.execute("DELETE FROM scrape_sessions RETURNING 1").fetchall()
+        attempt_deleted = conn.execute("DELETE FROM fetch_attempts RETURNING 1").fetchall()
+        analytics_deleted = conn.execute("DELETE FROM search_analytics RETURNING 1").fetchall()
         orphan_job_embeddings = conn.execute(
             """
             DELETE FROM embeddings
@@ -617,8 +705,42 @@ def purge_hosted_slice(*, target_dsn: str, policy: HostedSlicePolicy) -> dict[st
             """,
             (cutoff,),
         ).fetchall()
+        progress_keep = conn.execute(
+            """
+            SELECT id
+            FROM historical_scrape_progress
+            WHERE year = %s AND status = 'in_progress'
+            ORDER BY COALESCE(updated_at, started_at) DESC NULLS LAST, current_seq DESC, id DESC
+            LIMIT 1
+            """,
+            (hosted_year,),
+        ).fetchone()
+        if progress_keep:
+            progress_deleted = conn.execute(
+                "DELETE FROM historical_scrape_progress WHERE id <> %s RETURNING 1",
+                (progress_keep["id"],),
+            ).fetchall()
+        else:
+            progress_deleted = conn.execute("DELETE FROM historical_scrape_progress RETURNING 1").fetchall()
+        conn.execute(
+            """
+            UPDATE daemon_state
+            SET pid = NULL,
+                status = 'stopped',
+                last_heartbeat = NULL,
+                started_at = NULL,
+                current_year = NULL,
+                current_seq = NULL
+            WHERE id = 1
+            """
+        )
     return {
         "deleted_non_job_embeddings": len(company_deleted),
+        "deleted_job_history": len(history_deleted),
+        "deleted_scrape_sessions": len(scrape_session_deleted),
+        "deleted_fetch_attempts": len(attempt_deleted),
+        "deleted_search_analytics": len(analytics_deleted),
         "deleted_orphan_job_embeddings": len(orphan_job_embeddings),
         "deleted_jobs": len(deleted_jobs),
+        "deleted_historical_progress": len(progress_deleted),
     }
