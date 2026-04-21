@@ -61,8 +61,9 @@ export const Chip = forwardRef<HTMLElement, ChipProps>(function Chip(
   },
   ref,
 ) {
-  const interactive = Boolean(onClick || onRemove || active !== undefined)
-  const Tag: 'span' | 'button' = as ?? (interactive ? 'button' : 'span')
+  const hasInteractiveBody = Boolean(onClick || active !== undefined)
+  const Tag: 'span' | 'button' = as ?? (hasInteractiveBody ? 'button' : 'span')
+  const interactive = hasInteractiveBody || Boolean(onRemove)
 
   const classes = cn(
     'inline-flex items-center rounded-full font-medium transition whitespace-nowrap',

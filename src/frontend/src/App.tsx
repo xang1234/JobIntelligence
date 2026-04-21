@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { NavLink, Route, Routes, useLocation } from 'react-router-dom'
 import { Bars3Icon, MagnifyingGlassIcon } from '@heroicons/react/24/outline'
 import MatchLabPage from '@/pages/MatchLabPage'
@@ -33,6 +33,16 @@ export default function App() {
 
   const openPalette = useCallback(() => setPaletteOpen(true), [])
   const closePalette = useCallback(() => setPaletteOpen(false), [])
+
+  useEffect(() => {
+    const mql = window.matchMedia('(min-width: 1024px)')
+    const close = (e: MediaQueryListEvent | MediaQueryList) => {
+      if (e.matches) setMobileNavOpen(false)
+    }
+    close(mql)
+    mql.addEventListener('change', close)
+    return () => mql.removeEventListener('change', close)
+  }, [])
 
   useHotkeys({
     'mod+k': (e) => {
