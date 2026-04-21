@@ -73,6 +73,35 @@ export const Chip = forwardRef<HTMLElement, ChipProps>(function Chip(
     className,
   )
 
+  if (Tag === 'button' && onRemove) {
+    return (
+      <span className="inline-flex items-center">
+        <button
+          ref={ref as React.Ref<HTMLButtonElement>}
+          type={type ?? 'button'}
+          onClick={onClick}
+          aria-pressed={ariaPressed}
+          className={classes}
+          {...rest}
+        >
+          {leftIcon}
+          <span>{children}</span>
+        </button>
+        <button
+          type="button"
+          aria-label="Remove"
+          onClick={(e) => {
+            e.stopPropagation()
+            onRemove()
+          }}
+          className="-mr-1 inline-flex h-4 w-4 items-center justify-center rounded-full transition hover:bg-[color:var(--border)]"
+        >
+          <XMarkIcon className="h-3 w-3" aria-hidden="true" />
+        </button>
+      </span>
+    )
+  }
+
   if (Tag === 'button') {
     return (
       <button
@@ -85,18 +114,6 @@ export const Chip = forwardRef<HTMLElement, ChipProps>(function Chip(
       >
         {leftIcon}
         <span>{children}</span>
-        {onRemove && (
-          <span
-            role="presentation"
-            onClick={(e) => {
-              e.stopPropagation()
-              onRemove()
-            }}
-            className="-mr-1 inline-flex h-4 w-4 items-center justify-center rounded-full transition hover:bg-[color:var(--border)]"
-          >
-            <XMarkIcon className="h-3 w-3" />
-          </span>
-        )}
       </button>
     )
   }
@@ -105,6 +122,19 @@ export const Chip = forwardRef<HTMLElement, ChipProps>(function Chip(
     <span ref={ref as React.Ref<HTMLSpanElement>} className={classes} {...(rest as object)}>
       {leftIcon}
       <span>{children}</span>
+      {onRemove && (
+        <button
+          type="button"
+          aria-label="Remove"
+          onClick={(e) => {
+            e.stopPropagation()
+            onRemove()
+          }}
+          className="-mr-1 inline-flex h-4 w-4 items-center justify-center rounded-full transition hover:bg-[color:var(--border)]"
+        >
+          <XMarkIcon className="h-3 w-3" aria-hidden="true" />
+        </button>
+      )}
     </span>
   )
 })

@@ -72,26 +72,25 @@ export function Modal({
                   className,
                 )}
               >
+                <IconButton
+                  aria-label="Close dialog"
+                  icon={<XMarkIcon />}
+                  size="sm"
+                  onClick={onClose}
+                  className="absolute top-4 right-4"
+                />
                 {(title || description) && (
-                  <div className="flex items-start justify-between gap-4 px-6 pt-6 pb-4">
-                    <div className="min-w-0 flex-1">
-                      {title && (
-                        <DialogTitle className="text-lg font-semibold tracking-tight text-[color:var(--ink)]">
-                          {title}
-                        </DialogTitle>
-                      )}
-                      {description && (
-                        <p className="mt-1 text-sm text-[color:var(--ink-muted)]">
-                          {description}
-                        </p>
-                      )}
-                    </div>
-                    <IconButton
-                      aria-label="Close dialog"
-                      icon={<XMarkIcon />}
-                      size="sm"
-                      onClick={onClose}
-                    />
+                  <div className="px-6 pt-6 pb-4 pr-14">
+                    {title && (
+                      <DialogTitle className="text-lg font-semibold tracking-tight text-[color:var(--ink)]">
+                        {title}
+                      </DialogTitle>
+                    )}
+                    {description && (
+                      <p className="mt-1 text-sm text-[color:var(--ink-muted)]">
+                        {description}
+                      </p>
+                    )}
                   </div>
                 )}
                 <div className="px-6 pb-6">{children}</div>

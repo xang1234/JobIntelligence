@@ -1,4 +1,4 @@
-import { Fragment, useState, type ReactElement, type ReactNode } from 'react'
+import { Fragment, useEffect, useId, useRef, useState, type ReactElement, type ReactNode } from 'react'
 import { Transition } from '@headlessui/react'
 import { cn } from './cn'
 
@@ -25,19 +25,26 @@ export function Tooltip({
   className,
 }: TooltipProps) {
   const [open, setOpen] = useState(false)
-  const [timer, setTimer] = useState<number | null>(null)
+  const timerRef = useRef<number | null>(null)
+  const id = useId()
 
   const show = () => {
-    if (timer) window.clearTimeout(timer)
-    setTimer(window.setTimeout(() => setOpen(true), delayMs))
+    if (timerRef.current) window.clearTimeout(timerRef.current)
+    timerRef.current = window.setTimeout(() => setOpen(true), delayMs)
   }
   const hide = () => {
-    if (timer) {
-      window.clearTimeout(timer)
-      setTimer(null)
+    if (timerRef.current) {
+      window.clearTimeout(timerRef.current)
+      timerRef.current = null
     }
     setOpen(false)
   }
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) window.clearTimeout(timerRef.current)
+    }
+  }, [])
 
   return (
     <span
@@ -46,6 +53,7 @@ export function Tooltip({
       onMouseLeave={hide}
       onFocus={show}
       onBlur={hide}
+      aria-describedby={open ? id : undefined}
     >
       {children}
       <Transition
@@ -59,6 +67,7 @@ export function Tooltip({
         leaveTo="opacity-0 scale-95"
       >
         <span
+          id={id}
           role="tooltip"
           className={cn(
             'pointer-events-none absolute z-50 whitespace-nowrap rounded-[var(--radius-sm)] bg-[color:var(--color-neutral-900)] px-2.5 py-1.5 text-xs font-medium text-[color:var(--color-neutral-50)] shadow-[var(--shadow-md)]',

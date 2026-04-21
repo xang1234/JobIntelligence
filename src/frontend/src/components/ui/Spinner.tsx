@@ -20,7 +20,7 @@ export function Spinner({ size = 'sm', className, label = 'Loading' }: SpinnerPr
       fill="none"
       role="status"
       aria-label={label}
-      className={cn('animate-spin motion-reduce:hidden', SIZE[size], className)}
+      className={cn('animate-spin motion-reduce:animate-none', SIZE[size], className)}
     >
       <circle
         cx="12"

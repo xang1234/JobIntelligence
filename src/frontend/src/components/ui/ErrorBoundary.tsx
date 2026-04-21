@@ -33,7 +33,11 @@ export class ErrorBoundary extends Component<Props, State> {
       <div className="mx-auto max-w-xl px-6 py-12">
         <ErrorState
           title="Unexpected error"
-          description={error.message || 'An unexpected error occurred.'}
+          description={
+            import.meta.env.DEV
+              ? error.message || 'An unexpected error occurred.'
+              : 'An unexpected error occurred.'
+          }
           retryLabel="Reload"
           onRetry={() => {
             this.reset()

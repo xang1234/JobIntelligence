@@ -6,6 +6,7 @@ import {
   ComboboxOptions,
   Dialog,
   DialogPanel,
+  DialogTitle,
   Transition,
   TransitionChild,
 } from '@headlessui/react'
@@ -20,7 +21,7 @@ import {
 } from '@heroicons/react/24/outline'
 import { useNavigate } from 'react-router-dom'
 import { Kbd } from '@/components/ui'
-import { useTheme } from '@/hooks/useTheme'
+import { useTheme } from '@/contexts/ThemeContext'
 
 interface CommandPaletteProps {
   open: boolean
@@ -145,6 +146,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
               leaveTo="opacity-0 scale-95"
             >
               <DialogPanel className="overflow-hidden rounded-[var(--radius-2xl)] border border-[color:var(--border)] bg-[color:var(--surface-1)] shadow-[var(--shadow-xl)]">
+                <DialogTitle className="sr-only">Command palette</DialogTitle>
                 <Combobox
                   onChange={(action: Action | null) => action?.run()}
                 >

@@ -36,7 +36,7 @@ export default function RelatedSkillsGraph({ data, onSelectSkill }: RelatedSkill
           <button
             type="button"
             onClick={() => onSelectSkill(data.skill)}
-            className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[color:var(--brand)] px-5 py-2 text-sm font-semibold text-white shadow-[var(--shadow-md)] transition motion-safe:hover:scale-[1.03] focus-visible:outline-none"
+            className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[color:var(--brand)] px-5 py-2 text-sm font-semibold text-white shadow-[var(--shadow-md)] transition motion-safe:hover:scale-[1.03] focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-offset-2 focus-visible:ring-offset-[color:var(--brand)]"
             aria-label={`Search ${data.skill}`}
           >
             {data.skill}
@@ -58,7 +58,7 @@ export default function RelatedSkillsGraph({ data, onSelectSkill }: RelatedSkill
                   top: `${y}%`,
                   transition: 'left var(--duration-slow) var(--ease-standard), top var(--duration-slow) var(--ease-standard), transform var(--duration-base) var(--ease-standard)',
                 }}
-                className={`absolute -translate-x-1/2 -translate-y-1/2 rounded-full border px-3 py-1.5 text-xs font-semibold shadow-[var(--shadow-xs)] motion-safe:hover:scale-105 focus-visible:outline-none ${
+                className={`absolute -translate-x-1/2 -translate-y-1/2 rounded-full border px-3 py-1.5 text-xs font-semibold shadow-[var(--shadow-xs)] motion-safe:hover:scale-105 focus-visible:ring-2 focus-visible:ring-[color:var(--brand)] focus-visible:ring-offset-2 ${
                   skill.same_cluster
                     ? 'border-transparent bg-[color:var(--success-bg)] text-[color:var(--success-fg)]'
                     : 'border-[color:var(--border)] bg-[color:var(--surface-1)] text-[color:var(--ink-muted)]'

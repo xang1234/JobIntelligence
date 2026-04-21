@@ -1,5 +1,5 @@
 import { Fragment } from 'react'
-import { Dialog, DialogPanel, Transition, TransitionChild } from '@headlessui/react'
+import { Dialog, DialogPanel, DialogTitle, Transition, TransitionChild } from '@headlessui/react'
 import { XMarkIcon } from '@heroicons/react/24/outline'
 import { NavLink } from 'react-router-dom'
 import { IconButton } from '@/components/ui'
@@ -44,9 +44,9 @@ export default function MobileNav({ open, onClose, items }: MobileNavProps) {
           >
             <DialogPanel className="ml-auto flex h-full w-full max-w-xs flex-col bg-[color:var(--surface-1)] shadow-[var(--shadow-xl)]">
               <div className="flex items-center justify-between border-b border-[color:var(--border)] px-5 py-4">
-                <span className="text-xs font-semibold uppercase tracking-[0.26em] text-[color:var(--ink-subtle)]">
+                <DialogTitle as="span" className="text-xs font-semibold uppercase tracking-[0.26em] text-[color:var(--ink-subtle)]">
                   MCF Intelligence
-                </span>
+                </DialogTitle>
                 <IconButton
                   aria-label="Close navigation"
                   icon={<XMarkIcon />}

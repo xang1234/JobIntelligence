@@ -55,7 +55,7 @@ export function useUrlFilters(): UrlFiltersState {
           }
           return next
         },
-        { replace: false },
+        { replace: true },
       )
     },
     [setSearchParams],
@@ -92,7 +92,7 @@ export function useUrlFilters(): UrlFiltersState {
           next.delete(key)
           return next
         },
-        { replace: false },
+        { replace: true },
       )
     },
     [setSearchParams],

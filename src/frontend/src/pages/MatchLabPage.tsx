@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import JobCard from '@/components/JobCard'
 import { toast } from '@/components/ui'
@@ -917,6 +917,10 @@ export default function MatchLabPage() {
   const [detailErrors, setDetailErrors] = useState<Record<string, string>>({})
   const [detailLoadingId, setDetailLoadingId] = useState<string | null>(null)
   const [appliedScenario, setAppliedScenario] = useState<AppliedScenarioState | null>(null)
+  const appliedScenarioRef = useRef<AppliedScenarioState | null>(null)
+  useEffect(() => {
+    appliedScenarioRef.current = appliedScenario
+  }, [appliedScenario])
 
   const updateInputs = (updater: (current: MatchLabSharedInputs) => MatchLabSharedInputs) => {
     setInputs((current) => {
@@ -1016,6 +1020,7 @@ export default function MatchLabPage() {
       action: {
         label: 'Undo',
         onClick: () => {
+          if (appliedScenarioRef.current !== applied) return
           setInputs(applied.previousInputs)
           setAppliedScenario(null)
           runCurrentMatch(applied.previousInputs)

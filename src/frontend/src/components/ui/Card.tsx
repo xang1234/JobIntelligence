@@ -1,4 +1,4 @@
-import { forwardRef, type HTMLAttributes } from 'react'
+import { forwardRef, type HTMLAttributes, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { cn } from './cn'
 
 export type CardElevation = 0 | 1 | 2
@@ -53,6 +53,20 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
   ref,
 ) {
   const Tag = as as 'div'
+  const hasClickHandler = typeof (rest as HTMLAttributes<HTMLElement>).onClick === 'function'
+  const keyboardProps =
+    interactive && hasClickHandler
+      ? {
+          tabIndex: 0,
+          role: 'button' as const,
+          onKeyDown: (e: ReactKeyboardEvent<HTMLElement>) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault()
+              e.currentTarget.click()
+            }
+          },
+        }
+      : {}
   return (
     <Tag
       ref={ref}
@@ -63,8 +77,10 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
         INTENT[intent],
         interactive &&
           'cursor-pointer hover:shadow-[var(--shadow-card-hover)] motion-safe:hover:-translate-y-0.5',
+        interactive && hasClickHandler && 'focus-visible:ring-2 focus-visible:ring-[color:var(--brand)] focus-visible:ring-offset-2 focus-visible:outline-none',
         className,
       )}
+      {...keyboardProps}
       {...rest}
     >
       {children}

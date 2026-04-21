@@ -10,6 +10,7 @@ import { BrowserRouter } from 'react-router-dom'
 import './index.css'
 import App from './App.tsx'
 import { ErrorBoundary, toast, Toaster } from '@/components/ui'
+import { ThemeProvider } from '@/contexts/ThemeContext'
 import { resolveInitialTheme } from '@/hooks/useTheme'
 
 // Apply theme synchronously to avoid flash-of-unthemed-content.
@@ -58,7 +59,9 @@ createRoot(document.getElementById('root')!).render(
     <ErrorBoundary>
       <QueryClientProvider client={queryClient}>
         <BrowserRouter>
-          <App />
+          <ThemeProvider>
+            <App />
+          </ThemeProvider>
         </BrowserRouter>
       </QueryClientProvider>
       <Toaster />
